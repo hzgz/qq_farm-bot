@@ -73,10 +73,19 @@ type LoginBufferClient struct {
 }
 
 func NewLoginBufferClient(timeout time.Duration) *LoginBufferClient {
+	client, _ := NewHTTPClient(timeout, "")
 	return &LoginBufferClient{
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: client,
 		timeout:    timeout,
 	}
+}
+
+func NewLoginBufferClientWithProxy(timeout time.Duration, tcpProxy string) (*LoginBufferClient, error) {
+	client, err := NewHTTPClient(timeout, tcpProxy)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginBufferClient{httpClient: client, timeout: timeout}, nil
 }
 
 func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBufferCredentials) (string, error) {

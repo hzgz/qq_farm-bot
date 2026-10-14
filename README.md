@@ -35,6 +35,15 @@
 - **开机恢复上次运行账号**：启动脚本和主程序只恢复上次设置为运行的账号，已停止账号不会被误启动。
 - **应用宝服务独立运行**：主面板与应用宝扫码服务由 `start.bat` 一键启动，`tingzhi.bat` 可同时停止两者。
 
+### 每账号代理
+
+- **两种连接模式**：每个应用宝账号可独立选择“直连”或“静态代理”。
+- **静态代理协议**：支持 HTTP CONNECT 与 SOCKS5，均可按需填写用户名和密码。
+- **扫码前选择出口**：添加应用宝账号时可直接从已有代理配置库选择，扫码、OAuth 回调、用户资料和账号入库全程使用同一出口。
+- **完整协议链路**：凭据刷新、HTTPDNS、LongLink、ShortLink 和小程序 Code 请求均遵循该账号的代理设置。
+- **严格失败策略**：账号选定的静态代理不可用时直接返回错误，不会静默回退为服务器直连，避免出口意外变化。
+- **凭据自动续期**：直连和静态代理账号均支持业务调用时按需刷新及后台到期前续期。
+
 ### 农场自动化
 
 - **自动种植 / 收获**：支持背包种子优先、指定种子、播种顺序随机化、延迟控制。
@@ -169,7 +178,7 @@ node scripts/sync-game-config.js raw ItemInfo
 ### 方式一：源码运行（推荐本地使用）
 
 ```bash
-git clone https://github.com/Jia004/qq_farm-bot.git
+git clone https://github.com/hzgz/qq_farm-bot.git
 cd qq_farm-bot
 
 corepack enable
@@ -193,7 +202,7 @@ Windows 也可以直接运行仓库根目录的 `yunxing.bat`：脚本会注册�
 ### 方式二：Docker 部署
 
 ```bash
-git clone https://github.com/Jia004/qq_farm-bot.git
+git clone https://github.com/hzgz/qq_farm-bot.git
 cd qq_farm-bot
 
 docker compose up -d --build
@@ -295,6 +304,25 @@ pnpm package:release
 - 面板首次访问需要登录，默认 `admin` / `admin`。
 - 应用宝扫码服务默认账号为 `admin` / `123456`，由 `start.bat` 自动配置。
 - **部署后请立即修改默认密码。**
+
+### 应用宝账号代理
+
+进入“设置 → 代理设置”可维护静态代理配置库，并为每个应用宝账号单独绑定连接模式。添加应用宝扫码账号时，也可以在生成二维码前选择已有配置。
+
+代理凭据只保存在应用宝服务的本机 SQLite 数据库中，列表接口与页面不会回显密码。`core/data/` 可能包含代理密码、账号凭据等敏感信息，禁止提交到 GitHub。
+
+后台续期默认配置：
+
+```text
+YYB_KEEPALIVE_INTERVAL=1m
+YYB_KEEPALIVE_AHEAD=45m
+YYB_KEEPALIVE_PROXY_AHEAD=5m
+```
+
+- 每分钟只做一次轻量数据库检查。
+- 直连账号在凭据剩余不足 45 分钟时刷新。
+- 静态代理账号默认在剩余不足 5 分钟时刷新。
+- 设置 `YYB_KEEPALIVE_INTERVAL=0` 可关闭后台续期。
 
 ### 本次发行变更（`v2026.10.14`）
 

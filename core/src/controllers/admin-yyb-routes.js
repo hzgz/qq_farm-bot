@@ -84,6 +84,64 @@ async function callYybApi(apiBase, path, apiKey, init = {}) {
 }
 
 function registerAdminYybRoutes({ app, requireAdminToken, sendProviderError }) {
+  function sendYybResult(res, result, successStatus = 200) {
+    if (!result.ok) {
+      return res.status(result.retryable ? 502 : 400).json({ ok: false, error: result.error, yybCode: result.yybCode });
+    }
+    return res.status(successStatus).json({ ok: true, data: result.data });
+  }
+
+  // 静态代理配置库（密码仅保存在 YYB 本机 SQLite，列表接口只返回是否已配置）
+  app.get("/api/yyb/proxy-profiles", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey } = resolveYybCreds(req.query);
+    return sendYybResult(res, await callYybApi(apiBase, "/proxy-profiles", apiKey, { method: "GET" }));
+  });
+
+  app.post("/api/yyb/proxy-profiles", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey, ...profile } = resolveYybCreds(req.body);
+    return sendYybResult(res, await callYybApi(apiBase, "/proxy-profiles", apiKey, {
+      method: "POST",
+      body: JSON.stringify(profile),
+    }), 201);
+  });
+
+  app.put("/api/yyb/proxy-profiles", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey, ...profile } = resolveYybCreds(req.body);
+    return sendYybResult(res, await callYybApi(apiBase, "/proxy-profiles", apiKey, {
+      method: "PUT",
+      body: JSON.stringify(profile),
+    }));
+  });
+
+  app.delete("/api/yyb/proxy-profiles/:id", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey } = resolveYybCreds(req.query);
+    const id = encodeURIComponent(String(req.params.id || ""));
+    return sendYybResult(res, await callYybApi(apiBase, `/proxy-profiles?id=${id}`, apiKey, { method: "DELETE" }));
+  });
+
+  app.post("/api/yyb/proxy-profiles/:id/test", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey } = resolveYybCreds(req.body);
+    return sendYybResult(res, await callYybApi(apiBase, "/proxy-profiles/test", apiKey, {
+      method: "POST",
+      body: JSON.stringify({ proxy_profile_id: Number(req.params.id) }),
+    }));
+  });
+
+  app.get("/api/yyb/account-proxy", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey, ref } = resolveYybCreds(req.query);
+    if (!ref) return res.status(400).json({ ok: false, error: "缺少账号标识" });
+    return sendYybResult(res, await callYybApi(apiBase, `/accounts/proxy?ref=${encodeURIComponent(ref)}`, apiKey, { method: "GET" }));
+  });
+
+  app.put("/api/yyb/account-proxy", requireAdminToken, async (req, res) => {
+    const { apiBase, apiKey, ref, mode, proxyProfileId } = resolveYybCreds(req.body);
+    if (!ref) return res.status(400).json({ ok: false, error: "缺少账号标识" });
+    return sendYybResult(res, await callYybApi(apiBase, "/accounts/proxy", apiKey, {
+      method: "PUT",
+      body: JSON.stringify({ ref, mode, proxy_profile_id: mode === "static" ? Number(proxyProfileId) : null }),
+    }));
+  });
+
   // 拉应用宝账号列表
   app.post("/api/yyb/accounts", requireAdminToken, async (req, res) => {
     const { apiBase, apiKey } = resolveYybCreds(req.body);
@@ -143,8 +201,14 @@ function registerAdminYybRoutes({ app, requireAdminToken, sendProviderError }) {
 
   // 创建扫码会话（返回 base64 二维码）
   app.post("/api/yyb/qr/create", requireAdminToken, async (req, res) => {
-    const { apiBase, apiKey } = resolveYybCreds(req.body);
-    const result = await callYybApi(apiBase, "/qr?as_base64=true", apiKey, { method: "POST" });
+    const { apiBase, apiKey, proxyMode, proxyProfileId } = resolveYybCreds(req.body);
+    const result = await callYybApi(apiBase, "/qr?as_base64=true", apiKey, {
+      method: "POST",
+      body: JSON.stringify({
+        proxy_mode: proxyMode || "direct",
+        proxy_profile_id: proxyMode === "static" ? Number(proxyProfileId) : null,
+      }),
+    });
     if (!result.ok) {
       return res.status(400).json({ ok: false, error: result.error, yybCode: result.yybCode });
     }

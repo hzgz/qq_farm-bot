@@ -38,18 +38,22 @@ var (
 )
 
 type Session struct {
-	ID            string
-	WXUUID        string
-	QRCodeURL     string
-	CreatedAt     time.Time
-	HTTPClient    *http.Client
-	Jar           http.CookieJar
-	AuthorizeCode string
-	Credentials   *protocol.LoginBufferCredentials
-	LoginBuffer   string
-	Status        string
-	Error         string
-	mu            sync.Mutex
+	ID             string
+	WXUUID         string
+	QRCodeURL      string
+	CreatedAt      time.Time
+	HTTPClient     *http.Client
+	Jar            http.CookieJar
+	AuthorizeCode  string
+	Credentials    *protocol.LoginBufferCredentials
+	LoginBuffer    string
+	TCPProxy       string
+	ProxyMode      string
+	ProxyProfileID *int64
+	LoginBuffers   *protocol.LoginBufferClient
+	Status         string
+	Error          string
+	mu             sync.Mutex
 }
 
 func (s *Session) Age() time.Duration { return time.Since(s.CreatedAt) }
@@ -81,7 +85,11 @@ func NewClient(timeout time.Duration) *Client {
 func (c *Client) LoginBuffers() *protocol.LoginBufferClient { return c.loginBuffers }
 
 func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
-	sess, err := c.CreateSession(ctx)
+	return c.GetQRCodeImageWithProxy(ctx, "", "", nil)
+}
+
+func (c *Client) GetQRCodeImageWithProxy(ctx context.Context, proxyMode, tcpProxy string, profileID *int64) (ImageResult, error) {
+	sess, err := c.CreateSessionWithProxy(ctx, proxyMode, tcpProxy, profileID)
 	if err != nil {
 		return ImageResult{}, err
 	}
@@ -93,11 +101,23 @@ func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 }
 
 func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
+	return c.CreateSessionWithProxy(ctx, "", "", nil)
+}
+
+func (c *Client) CreateSessionWithProxy(ctx context.Context, proxyMode, tcpProxy string, profileID *int64) (*Session, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: c.timeout, Jar: jar}
+	hc, err := protocol.NewHTTPClient(c.timeout, tcpProxy)
+	if err != nil {
+		return nil, err
+	}
+	hc.Jar = jar
+	loginBuffers, err := protocol.NewLoginBufferClientWithProxy(c.timeout, tcpProxy)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauthURL, nil)
 	if err != nil {
 		return nil, err
@@ -119,13 +139,17 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	}
 	wxuuid := m[1]
 	return &Session{
-		ID:         id,
-		WXUUID:     wxuuid,
-		QRCodeURL:  qrBase + wxuuid,
-		CreatedAt:  time.Now(),
-		HTTPClient: hc,
-		Jar:        jar,
-		Status:     "pending",
+		ID:             id,
+		WXUUID:         wxuuid,
+		QRCodeURL:      qrBase + wxuuid,
+		CreatedAt:      time.Now(),
+		HTTPClient:     hc,
+		Jar:            jar,
+		TCPProxy:       tcpProxy,
+		ProxyMode:      proxyMode,
+		ProxyProfileID: profileID,
+		LoginBuffers:   loginBuffers,
+		Status:         "pending",
 	}, nil
 }
 
@@ -251,7 +275,11 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
-	lb, err := c.loginBuffers.FetchLoginBuffer(ctx, creds)
+	loginBuffers := sess.LoginBuffers
+	if loginBuffers == nil {
+		loginBuffers = c.loginBuffers
+	}
+	lb, err := loginBuffers.FetchLoginBuffer(ctx, creds)
 	if err != nil {
 		return protocol.LoginBufferResult{}, err
 	}
@@ -263,6 +291,14 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 
 func (c *Client) RefreshLoginBuffer(ctx context.Context, creds protocol.LoginBufferCredentials) (protocol.LoginBufferResult, error) {
 	return c.loginBuffers.RefreshLoginBuffer(ctx, creds)
+}
+
+func (c *Client) RefreshLoginBufferWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, tcpProxy string) (protocol.LoginBufferResult, error) {
+	client, err := protocol.NewLoginBufferClientWithProxy(c.timeout, tcpProxy)
+	if err != nil {
+		return protocol.LoginBufferResult{}, err
+	}
+	return client.RefreshLoginBuffer(ctx, creds)
 }
 
 func DataURIJPEG(data []byte) string {

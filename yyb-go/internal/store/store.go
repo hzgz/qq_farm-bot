@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -31,6 +33,25 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_wxacc_uin ON wechat_accounts(uin);
+
+CREATE TABLE IF NOT EXISTS proxy_profiles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL UNIQUE,
+    protocol   TEXT    NOT NULL,
+    host       TEXT    NOT NULL,
+    port       INTEGER NOT NULL,
+    username   TEXT    NOT NULL DEFAULT '',
+    password   TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS account_proxy_settings (
+    wechat_account_id INTEGER PRIMARY KEY REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    mode              TEXT    NOT NULL DEFAULT 'direct',
+    proxy_profile_id  INTEGER REFERENCES proxy_profiles(id) ON DELETE SET NULL,
+    updated_at        INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +111,38 @@ type AccountPublic struct {
 	LastCheckedAt *int64  `json:"last_checked_at"`
 	CreatedAt     int64   `json:"created_at"`
 	UpdatedAt     int64   `json:"updated_at"`
+}
+
+type ProxyProfile struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Protocol  string `json:"protocol"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Username  string `json:"username"`
+	Password  string `json:"-"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type ProxyProfilePublic struct {
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Protocol           string `json:"protocol"`
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	Username           string `json:"username"`
+	PasswordConfigured bool   `json:"password_configured"`
+	CreatedAt          int64  `json:"created_at"`
+	UpdatedAt          int64  `json:"updated_at"`
+}
+
+type AccountProxySetting struct {
+	AccountID      int64               `json:"account_id"`
+	Mode           string              `json:"mode"`
+	ProxyProfileID *int64              `json:"proxy_profile_id"`
+	Profile        *ProxyProfilePublic `json:"profile,omitempty"`
+	UpdatedAt      int64               `json:"updated_at"`
 }
 
 type SessionRow struct {
@@ -320,6 +373,107 @@ func (db *DB) DeleteAccount(ctx context.Context, id int64) error {
 	return err
 }
 
+func (db *DB) ListProxyProfiles(ctx context.Context) ([]ProxyProfilePublic, error) {
+	rows, err := db.sql.QueryContext(ctx, `SELECT id, name, protocol, host, port, username, password, created_at, updated_at FROM proxy_profiles ORDER BY name, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ProxyProfilePublic, 0)
+	for rows.Next() {
+		profile, err := scanProxyProfile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, profile.Public())
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) GetProxyProfile(ctx context.Context, id int64) (*ProxyProfile, error) {
+	return scanProxyProfile(db.sql.QueryRowContext(ctx, `SELECT id, name, protocol, host, port, username, password, created_at, updated_at FROM proxy_profiles WHERE id=?`, id))
+}
+
+func (db *DB) UpsertProxyProfile(ctx context.Context, id int64, name, protocolName, host string, port int, username, password string, keepPassword bool) (*ProxyProfile, error) {
+	now := time.Now().Unix()
+	if id > 0 {
+		if keepPassword {
+			_, err := db.sql.ExecContext(ctx, `UPDATE proxy_profiles SET name=?, protocol=?, host=?, port=?, username=?, updated_at=? WHERE id=?`, name, protocolName, host, port, username, now, id)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			_, err := db.sql.ExecContext(ctx, `UPDATE proxy_profiles SET name=?, protocol=?, host=?, port=?, username=?, password=?, updated_at=? WHERE id=?`, name, protocolName, host, port, username, password, now, id)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return db.GetProxyProfile(ctx, id)
+	}
+	result, err := db.sql.ExecContext(ctx, `INSERT INTO proxy_profiles(name, protocol, host, port, username, password, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`, name, protocolName, host, port, username, password, now, now)
+	if err != nil {
+		return nil, err
+	}
+	newID, err := result.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return db.GetProxyProfile(ctx, newID)
+}
+
+func (db *DB) DeleteProxyProfile(ctx context.Context, id int64) error {
+	var count int
+	if err := db.sql.QueryRowContext(ctx, `SELECT count(*) FROM account_proxy_settings WHERE proxy_profile_id=? AND mode='static'`, id).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("proxy profile is used by %d account(s)", count)
+	}
+	_, err := db.sql.ExecContext(ctx, `DELETE FROM proxy_profiles WHERE id=?`, id)
+	return err
+}
+
+func (db *DB) GetAccountProxySetting(ctx context.Context, accountID int64) (AccountProxySetting, error) {
+	setting := AccountProxySetting{AccountID: accountID, Mode: "direct"}
+	var profileID sql.NullInt64
+	err := db.sql.QueryRowContext(ctx, `SELECT mode, proxy_profile_id, updated_at FROM account_proxy_settings WHERE wechat_account_id=?`, accountID).Scan(&setting.Mode, &profileID, &setting.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return setting, nil
+	}
+	if err != nil {
+		return setting, err
+	}
+	if profileID.Valid {
+		setting.ProxyProfileID = &profileID.Int64
+		if profile, getErr := db.GetProxyProfile(ctx, profileID.Int64); getErr == nil {
+			public := profile.Public()
+			setting.Profile = &public
+		}
+	}
+	return setting, nil
+}
+
+func (db *DB) SetAccountProxySetting(ctx context.Context, accountID int64, mode string, profileID *int64) (AccountProxySetting, error) {
+	now := time.Now().Unix()
+	_, err := db.sql.ExecContext(ctx, `INSERT INTO account_proxy_settings(wechat_account_id, mode, proxy_profile_id, updated_at) VALUES(?,?,?,?) ON CONFLICT(wechat_account_id) DO UPDATE SET mode=excluded.mode, proxy_profile_id=excluded.proxy_profile_id, updated_at=excluded.updated_at`, accountID, mode, nullableInt(profileID), now)
+	if err != nil {
+		return AccountProxySetting{}, err
+	}
+	return db.GetAccountProxySetting(ctx, accountID)
+}
+
+func (db *DB) ResolveAccountTCPProxy(ctx context.Context, accountID int64) (string, error) {
+	setting, err := db.GetAccountProxySetting(ctx, accountID)
+	if err != nil || setting.Mode != "static" || setting.ProxyProfileID == nil {
+		return "", err
+	}
+	profile, err := db.GetProxyProfile(ctx, *setting.ProxyProfileID)
+	if err != nil {
+		return "", err
+	}
+	return profile.ProxyURL(), nil
+}
+
 func (db *DB) GetSession(ctx context.Context, accountID int64, tcpProxy string) (*SessionRow, error) {
 	row := db.sql.QueryRowContext(ctx,
 		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=? AND expires_at>?",
@@ -348,6 +502,11 @@ func (db *DB) PutSession(ctx context.Context, accountID int64, uin *int64, sessi
 
 func (db *DB) InvalidateSession(ctx context.Context, accountID int64, tcpProxy string) error {
 	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?", accountID, tcpProxy)
+	return err
+}
+
+func (db *DB) InvalidateAllSessions(ctx context.Context, accountID int64) error {
+	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", accountID)
 	return err
 }
 
@@ -439,6 +598,37 @@ type accountScanner interface {
 
 type featureScanner interface {
 	Scan(dest ...any) error
+}
+
+func (p ProxyProfile) Public() ProxyProfilePublic {
+	return ProxyProfilePublic{
+		ID: p.ID, Name: p.Name, Protocol: p.Protocol, Host: p.Host, Port: p.Port,
+		Username: p.Username, PasswordConfigured: p.Password != "", CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func (p ProxyProfile) ProxyURL() string {
+	scheme := p.Protocol
+	if scheme == "http" {
+		scheme = "http-connect"
+	}
+	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(p.Host, strconv.Itoa(p.Port))}
+	if p.Username != "" {
+		if p.Password != "" {
+			u.User = url.UserPassword(p.Username, p.Password)
+		} else {
+			u.User = url.User(p.Username)
+		}
+	}
+	return u.String()
+}
+
+func scanProxyProfile(row accountScanner) (*ProxyProfile, error) {
+	var profile ProxyProfile
+	if err := row.Scan(&profile.ID, &profile.Name, &profile.Protocol, &profile.Host, &profile.Port, &profile.Username, &profile.Password, &profile.CreatedAt, &profile.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &profile, nil
 }
 
 func (db *DB) scanAccount(row accountScanner) (*WechatAccount, error) {

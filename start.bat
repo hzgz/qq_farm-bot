@@ -39,13 +39,22 @@ set /p "YYB_API_TOKEN="<"%YYB_TOKEN_FILE%"
 set "YYB_API_KEY=%YYB_API_TOKEN%"
 set "YYB_API_URL=http://127.0.0.1:%YYB_PORT%"
 
-if not exist "%YYB_EXE%" (
+set "YYB_NEEDS_BUILD=0"
+if not exist "%YYB_EXE%" set "YYB_NEEDS_BUILD=1"
+if exist "%YYB_EXE%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$exe=(Get-Item -LiteralPath $env:YYB_EXE).LastWriteTimeUtc; if(Get-ChildItem -LiteralPath $env:YYB_WORK_DIR -Recurse -File -Filter '*.go' | Where-Object { $_.LastWriteTimeUtc -gt $exe } | Select-Object -First 1){ exit 0 }; exit 1"
+    if not errorlevel 1 set "YYB_NEEDS_BUILD=1"
+)
+
+if "%YYB_NEEDS_BUILD%"=="1" (
     where go >nul 2>nul
     if errorlevel 1 (
         echo [ERROR] Go was not found. Cannot build the YYB service.
         exit /b 1
     )
-    echo [INFO] Building YYB service for the first run...
+    rem Windows locks a running EXE. Stop only the YYB listener before replacing it.
+    for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:":%YYB_PORT% .*LISTENING"') do taskkill /pid %%P /t /f >nul 2>nul
+    echo [INFO] Building updated YYB service...
     pushd "%YYB_WORK_DIR%"
     set "GOPROXY=https://goproxy.cn,direct"
     go build -o "%YYB_EXE%" .\cmd\yyb-go
@@ -85,8 +94,17 @@ if not exist "%~dp0core\node_modules" (
     )
 )
 
-if not exist "%~dp0web\dist\index.html" (
-    echo [INFO] Web dist not found, building once...
+set "WEB_DIST_INDEX=%~dp0web\dist\index.html"
+set "WEB_SOURCE_DIR=%~dp0web\src"
+set "WEB_NEEDS_BUILD=0"
+if not exist "%WEB_DIST_INDEX%" set "WEB_NEEDS_BUILD=1"
+if exist "%WEB_DIST_INDEX%" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$dist=(Get-Item -LiteralPath $env:WEB_DIST_INDEX).LastWriteTimeUtc; if(Get-ChildItem -LiteralPath $env:WEB_SOURCE_DIR -Recurse -File | Where-Object { $_.LastWriteTimeUtc -gt $dist } | Select-Object -First 1){ exit 0 }; exit 1"
+    if not errorlevel 1 set "WEB_NEEDS_BUILD=1"
+)
+
+if "%WEB_NEEDS_BUILD%"=="1" (
+    echo [INFO] Building updated web panel...
     call %PNPM_CMD% -C web build
     if errorlevel 1 (
         echo [ERROR] Web build failed.

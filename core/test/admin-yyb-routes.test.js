@@ -2,13 +2,23 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { registerAdminYybRoutes } = require('../src/controllers/admin-yyb-routes');
 
-function pollHandler() {
+function registeredRoutes() {
   const routes = new Map();
+  const app = {
+    get(path, _auth, handler) { routes.set(`GET ${path}`, handler); },
+    post(path, _auth, handler) { routes.set(`POST ${path}`, handler); },
+    put(path, _auth, handler) { routes.set(`PUT ${path}`, handler); },
+    delete(path, _auth, handler) { routes.set(`DELETE ${path}`, handler); },
+  };
   registerAdminYybRoutes({
-    app: { post(path, _auth, handler) { routes.set(path, handler); } },
+    app,
     requireAdminToken() {},
   });
-  return routes.get('/api/yyb/qr/poll');
+  return routes;
+}
+
+function pollHandler() {
+  return registeredRoutes().get('POST /api/yyb/qr/poll');
 }
 
 async function poll() {
@@ -49,4 +59,33 @@ test('QR proxy exposes network timeout as retryable instead of a bad request', a
   const response = await poll();
   assert.equal(response.statusCode, 502);
   assert.equal(response.body.ok, false);
+});
+
+test('QR create forwards the selected static proxy profile', async (t) => {
+  let forwardedBody = null;
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    forwardedBody = JSON.parse(init.body);
+    return {
+      status: 200,
+      json: async () => ({ code: 0, data: { session_id: 'session-1', status: 'pending' } }),
+    };
+  });
+
+  const response = {
+    statusCode: 200,
+    status(value) { this.statusCode = value; return this; },
+    json(value) { this.body = value; return this; },
+  };
+  const handler = registeredRoutes().get('POST /api/yyb/qr/create');
+  await handler({
+    body: {
+      apiBase: 'http://yyb.test',
+      apiKey: 'test-token',
+      proxyMode: 'static',
+      proxyProfileId: 7,
+    },
+  }, response);
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(forwardedBody, { proxy_mode: 'static', proxy_profile_id: 7 });
 });

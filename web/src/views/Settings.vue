@@ -4,6 +4,7 @@ import api from '@/api'
 import ConfirmModal from '@/components/ConfirmModal.vue'
 import AccountSettingsTab from '@/components/settings/AccountSettingsTab.vue'
 import DefaultPlanSettingsTab from '@/components/settings/DefaultPlanSettingsTab.vue'
+import ProxySettingsTab from '@/components/settings/ProxySettingsTab.vue'
 import UserSettingsTab from '@/components/settings/UserSettingsTab.vue'
 import { useAccountSettings } from '@/composables/settings/useAccountSettings'
 import { useUserSettings } from '@/composables/settings/useUserSettings'
@@ -13,11 +14,11 @@ import { useStrategySettings } from '@/composables/settings/useStrategySettings'
 
 const settingStore = useSettingStore()
 
-type SettingsTabKey = 'account' | 'default-plan' | 'user'
+type SettingsTabKey = 'account' | 'proxy' | 'default-plan' | 'user'
 
 function getInitialSettingsTab(): SettingsTabKey {
   const saved = localStorage.getItem('settings-active-tab')
-  return saved === 'default-plan' || saved === 'user'
+  return saved === 'proxy' || saved === 'default-plan' || saved === 'user'
     ? saved
     : 'account'
 }
@@ -38,6 +39,7 @@ watch(activeTab, (newTab) => {
 
 const tabs = [
   { key: 'account', label: '账号管理', icon: 'i-carbon-user-settings' },
+  { key: 'proxy', label: '代理设置', icon: 'i-carbon-network-3' },
   { key: 'default-plan', label: '默认方案', icon: 'i-carbon-settings-adjust' },
   { key: 'user', label: '用户管理', icon: 'i-carbon-user' },
 ] as const
@@ -263,6 +265,12 @@ onMounted(async () => {
           :fetch-bag-seeds="fetchBagSeeds"
           :fertilizer-land-type-options="fertilizerLandTypeOptions"
           :fertilizer-options="fertilizerOptions"
+          @notify="showAlert"
+        />
+
+        <ProxySettingsTab
+          v-else-if="activeTab === 'proxy'"
+          :accounts="accounts"
           @notify="showAlert"
         />
 

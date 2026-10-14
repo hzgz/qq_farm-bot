@@ -42,8 +42,9 @@ type App struct {
 	pool      *protocol.Pool
 	qr        *qr.Client
 
-	mu         sync.Mutex
-	qrSessions map[string]*qr.Session
+	mu              sync.Mutex
+	qrSessions      map[string]*qr.Session
+	keepaliveCancel context.CancelFunc
 }
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -88,19 +89,25 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.SessionTTL = cfg.SessionTTL
 	poolCfg.ShortlinkTimeout = cfg.RequestTimeout
 	poolCfg.TCPProxy = cfg.TCPProxy
+	poolCfg.TCPProxyFallbackDirect = false
 	pool := protocol.NewPool(poolCfg, db)
 	go sessionCleanupLoop()
-	return &App{
+	app := &App{
 		cfg:        cfg,
 		resources:  res,
 		db:         db,
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
-	}, nil
+	}
+	app.startKeepalive()
+	return app, nil
 }
 
 func (a *App) Close() error {
+	if a.keepaliveCancel != nil {
+		a.keepaliveCancel()
+	}
 	if a.db != nil {
 		return a.db.Close()
 	}
@@ -136,6 +143,9 @@ func (a *App) Handler() http.Handler {
 	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
 	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
 	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
+	router.Any("/accounts/proxy", gin.WrapF(a.handleAccountProxy))
+	router.Any("/proxy-profiles", gin.WrapF(a.handleProxyProfiles))
+	router.Any("/proxy-profiles/test", gin.WrapF(a.handleProxyProfileTest))
 	router.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
 	router.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	router.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
@@ -213,7 +223,20 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 	a.pruneQR()
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.RequestTimeout+35*time.Second)
 	defer cancel()
-	img, err := a.qr.GetQRCodeImage(ctx)
+	var body struct {
+		ProxyMode      string `json:"proxy_mode"`
+		ProxyProfileID *int64 `json:"proxy_profile_id"`
+	}
+	if err := decodeOptionalJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	proxyMode, tcpProxy, profileID, err := a.resolveRequestedProxy(ctx, body.ProxyMode, body.ProxyProfileID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	img, err := a.qr.GetQRCodeImageWithProxy(ctx, proxyMode, tcpProxy, profileID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -229,9 +252,11 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 	_ = os.WriteFile(path, img.ImageBytes, 0o644)
 	a.cleanupQR(keep)
 	out := map[string]any{
-		"session_id": img.Session.ID,
-		"status":     img.Session.Status,
-		"image_url":  "/qr/" + img.Session.ID + "/image",
+		"session_id":       img.Session.ID,
+		"status":           img.Session.Status,
+		"image_url":        "/qr/" + img.Session.ID + "/image",
+		"proxy_mode":       proxyMode,
+		"proxy_profile_id": profileID,
 	}
 	if r.URL.Query().Get("as_base64") == "true" {
 		out["image_base64"] = qr.DataURIJPEG(img.ImageBytes)
@@ -296,13 +321,24 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var userInfo map[string]any
-		if ui, err := a.qr.LoginBuffers().FetchUserInfo(r.Context(), result.Credentials); err == nil {
+		loginBuffers := sess.LoginBuffers
+		if loginBuffers == nil {
+			loginBuffers = a.qr.LoginBuffers()
+		}
+		if ui, err := loginBuffers.FetchUserInfo(r.Context(), result.Credentials); err == nil {
 			userInfo = ui
 		}
-		acc, err := a.storeFromScan(r.Context(), result.LoginBuffer, result.Credentials, userInfo)
+		acc, err := a.storeFromScan(r.Context(), result.LoginBuffer, result.Credentials, userInfo, sess.TCPProxy)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if sess.ProxyMode != "" {
+			if _, err = a.db.SetAccountProxySetting(r.Context(), acc.ID, sess.ProxyMode, sess.ProxyProfileID); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			_ = a.db.InvalidateAllSessions(r.Context(), acc.ID)
 		}
 		a.dropQRSession(sessionID)
 		writeJSON(w, http.StatusOK, acc.Public())
@@ -478,7 +514,12 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 				return
 			}
 			// Force refresh login_buffer first
-			_ = a.db.InvalidateSession(r.Context(), acc.ID, a.cfg.TCPProxy)
+			proxy, proxyErr := a.accountTCPProxy(r.Context(), acc.ID)
+			if proxyErr != nil {
+				writeError(w, http.StatusBadGateway, "account proxy unavailable: "+proxyErr.Error())
+				return
+			}
+			_ = a.db.InvalidateSession(r.Context(), acc.ID, proxy)
 			status := a.refreshLiveness(r.Context(), acc)
 			if status != "alive" {
 				writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
@@ -491,7 +532,7 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 			}
 			log.Printf("[farm5] got fresh login_buffer, getting code for %s", acc.OpenID)
 			// Get a fresh code every time
-			result, err := a.pool.GetCode(r.Context(), acc.LoginBuffer, "wx5306c5978fdb76e4", acc.ID, a.cfg.TCPProxy)
+			result, err := a.pool.GetCode(r.Context(), acc.LoginBuffer, "wx5306c5978fdb76e4", acc.ID, proxy)
 			if err != nil {
 				writeError(w, http.StatusBadGateway, "getCode failed: "+err.Error())
 				return
@@ -625,10 +666,10 @@ func (a *App) serveAvatar(w http.ResponseWriter, r *http.Request, acc *store.Wec
 	writeError(w, http.StatusNotFound, "no avatar")
 }
 
-func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds protocol.LoginBufferCredentials, userInfo map[string]any) (*store.WechatAccount, error) {
+func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds protocol.LoginBufferCredentials, userInfo map[string]any, tcpProxy string) (*store.WechatAccount, error) {
 	openid := creds.OpenID
 	nick := pickNickname(userInfo, creds.Nickname)
-	avatar := a.resolveAvatar(ctx, openid, userInfo)
+	avatar := a.resolveAvatar(ctx, openid, userInfo, tcpProxy)
 	status := "alive"
 	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMap(), &status)
 }
@@ -639,14 +680,24 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		return "unknown"
 	}
 	creds := protocol.CredentialsFromMap(acc.Credentials)
-	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
+	proxy, proxyErr := a.accountTCPProxy(ctx, acc.ID)
+	if proxyErr != nil {
+		_ = a.db.SetAccountStatus(ctx, acc.ID, "proxy_error")
+		return "proxy_error"
+	}
+	result, err := a.qr.RefreshLoginBufferWithProxy(ctx, creds, proxy)
 	if err != nil {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return "expired"
+		// Network and proxy failures must not destroy an otherwise valid account.
+		// Only an explicit upstream refresh rejection marks it expired.
+		if strings.Contains(strings.ToLower(err.Error()), "refresh failed: code=") {
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+			return "expired"
+		}
+		return "retry"
 	}
 	_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
 	_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
-	if avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo); avatar != "" {
+	if avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo, proxy); avatar != "" {
 		_ = a.db.SetAccountProfile(ctx, acc.ID, acc.Nickname, &avatar, acc.UserInfo)
 	}
 	return "alive"
@@ -654,7 +705,11 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 
 func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*store.WechatAccount, error) {
 	nick := pickNickname(acc.UserInfo, deref(acc.Nickname))
-	avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo)
+	proxy, err := a.accountTCPProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo, proxy)
 	if avatar == "" {
 		avatar = deref(acc.Avatar)
 	}
@@ -669,7 +724,10 @@ type accountExpiredError struct{ openid string }
 func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
 
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
-	proxy := a.cfg.TCPProxy
+	proxy, err := a.accountTCPProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := a.db.GetSession(ctx, acc.ID, proxy); err == nil {
 		result, err := call(ctx, acc, appID, payload)
 		if err == nil {
@@ -689,15 +747,35 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 }
 
 func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	proxy, err := a.accountTCPProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, proxy)
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	proxy, err := a.accountTCPProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, proxy)
 }
 
 func (a *App) invokeOperateWXData(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any) (map[string]any, error) {
-	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, a.cfg.TCPProxy)
+	proxy, err := a.accountTCPProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, err
+	}
+	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, proxy)
+}
+
+func (a *App) accountTCPProxy(ctx context.Context, accountID int64) (string, error) {
+	proxy, err := a.db.ResolveAccountTCPProxy(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	return proxy, nil
 }
 
 func refreshOut(acc *store.WechatAccount, status string) map[string]any {
@@ -720,26 +798,29 @@ func pickAvatarURL(userInfo map[string]any) string {
 	return ""
 }
 
-func (a *App) resolveAvatar(ctx context.Context, openid string, userInfo map[string]any) string {
+func (a *App) resolveAvatar(ctx context.Context, openid string, userInfo map[string]any, tcpProxy string) string {
 	u := pickAvatarURL(userInfo)
 	if u == "" {
 		return ""
 	}
 	dest := a.resources.avatarPath(openid)
-	if downloadAvatar(ctx, u, dest, a.cfg.AvatarTimeout) {
+	if downloadAvatar(ctx, u, dest, a.cfg.AvatarTimeout, tcpProxy) {
 		return dest
 	}
 	return u
 }
 
-func downloadAvatar(ctx context.Context, url, dest string, timeout time.Duration) bool {
+func downloadAvatar(ctx context.Context, url, dest string, timeout time.Duration, tcpProxy string) bool {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
-	client := &http.Client{Timeout: timeout}
+	client, err := protocol.NewHTTPClient(timeout, tcpProxy)
+	if err != nil {
+		return false
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false

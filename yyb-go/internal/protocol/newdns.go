@@ -54,12 +54,12 @@ func buildDNSQuery(clientVersion int, deviceType string, uin int) string {
 	return v.Encode()
 }
 
-func requestNewDNS(ctx context.Context, connectTo string, timeout time.Duration) (int, map[string]any, string, error) {
+func requestNewDNS(ctx context.Context, connectTo string, timeout time.Duration, tcpProxy string) (int, map[string]any, string, error) {
 	host := connectTo
 	if host == "" {
 		host = newdnsHost
 	}
-	conn, err := dialDirect(ctx, host, 80, timeout)
+	conn, err := dialTCP(ctx, host, 80, timeout, tcpProxy, false)
 	if err != nil {
 		return 0, nil, "", err
 	}
@@ -90,8 +90,11 @@ func requestNewDNS(ctx context.Context, connectTo string, timeout time.Duration)
 	return status, obj, text, nil
 }
 
-func getDNSParsed(ctx context.Context, timeout, cacheTTL time.Duration, force bool) (map[string]dnsDomain, error) {
-	key := "0|Windows"
+func getDNSParsed(ctx context.Context, timeout, cacheTTL time.Duration, force bool, tcpProxy string) (map[string]dnsDomain, error) {
+	// Keep direct and per-account proxy paths in separate cache buckets. Reusing
+	// a direct HTTPDNS result for a proxied account can select an endpoint that
+	// is only suitable for the server's own network path.
+	key := "0|Windows|" + tcpProxy
 	now := time.Now()
 	if !force && cacheTTL > 0 {
 		dnsCache.Lock()
@@ -103,7 +106,7 @@ func getDNSParsed(ctx context.Context, timeout, cacheTTL time.Duration, force bo
 	}
 	var last error
 	for _, connectTo := range []string{"", newdnsBackupIP} {
-		status, obj, text, err := requestNewDNS(ctx, connectTo, timeout)
+		status, obj, text, err := requestNewDNS(ctx, connectTo, timeout, tcpProxy)
 		if err != nil {
 			last = err
 			continue
@@ -204,16 +207,16 @@ func serversFor(parsed map[string]dnsDomain, domain, proto string) []Target {
 	return out
 }
 
-func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([]Target, error) {
-	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
+func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration, tcpProxy string) ([]Target, error) {
+	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false, tcpProxy)
 	if err != nil {
 		return nil, err
 	}
 	return serversFor(parsed, longlinkDomain, protoMMTLS), nil
 }
 
-func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) []Target {
-	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
+func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration, tcpProxy string) []Target {
+	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false, tcpProxy)
 	if err != nil {
 		return []Target{{IP: "120.241.131.173", Port: 80}}
 	}
@@ -233,13 +236,16 @@ func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) [
 }
 
 func orderLonglinkTargets(targets []Target, max int) []Target {
-	pref := []int{8080, 80, 443, 5000}
+	// Prefer the broadly reachable TLS-like port, but retain every IP:port
+	// candidate. A proxy may allow 443 while blocking 80/8080 on the same IP.
+	pref := []int{443, 8080, 80, 5000}
 	seen := map[string]bool{}
 	var out []Target
 	for _, p := range pref {
 		for _, t := range targets {
-			if t.Port == p && !seen[t.IP] {
-				seen[t.IP] = true
+			key := net.JoinHostPort(t.IP, strconv.Itoa(t.Port))
+			if t.Port == p && !seen[key] {
+				seen[key] = true
 				out = append(out, t)
 			}
 		}

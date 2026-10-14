@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ type tcpProxy struct {
 	Scheme string
 	Host   string
 	Port   string
+	User   *url.Userinfo
 }
 
 func parseTCPProxy(value string) (*tcpProxy, error) {
@@ -33,7 +35,7 @@ func parseTCPProxy(value string) (*tcpProxy, error) {
 	if u.Hostname() == "" || u.Port() == "" {
 		return nil, fmt.Errorf("tcp_proxy must include host and port")
 	}
-	return &tcpProxy{Scheme: u.Scheme, Host: u.Hostname(), Port: u.Port()}, nil
+	return &tcpProxy{Scheme: u.Scheme, Host: u.Hostname(), Port: u.Port(), User: u.User}, nil
 }
 
 func dialTCP(ctx context.Context, host string, port int, timeout time.Duration, proxyValue string, fallbackDirect bool) (net.Conn, error) {
@@ -65,34 +67,81 @@ func dialDirect(ctx context.Context, host string, port int, timeout time.Duratio
 func dialViaProxy(ctx context.Context, proxy *tcpProxy, targetHost string, targetPort int, timeout time.Duration) (net.Conn, error) {
 	conn, err := dialDirect(ctx, proxy.Host, mustAtoi(proxy.Port), timeout)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial proxy failed: %w", err)
 	}
+	deadline := time.Time{}
 	if timeout > 0 {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
-		defer conn.SetDeadline(time.Time{})
+		deadline = time.Now().Add(timeout)
 	}
+	if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+		deadline = ctxDeadline
+	}
+	if !deadline.IsZero() {
+		_ = conn.SetDeadline(deadline)
+	}
+	// A TCP connection can succeed while the proxy handshake stalls. Propagate
+	// context cancellation to the blocking read/write and wait for the callback
+	// before clearing the temporary deadline.
+	cancelFinished := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(cancelFinished)
+	})
 	if proxy.Scheme == "socks5" {
-		err = socks5Connect(conn, targetHost, targetPort)
+		err = socks5Connect(conn, proxy.User, targetHost, targetPort)
 	} else {
-		err = httpConnect(conn, targetHost, targetPort)
+		err = httpConnect(conn, proxy.User, targetHost, targetPort)
 	}
+	if !stopCancel() {
+		<-cancelFinished
+	}
+	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("%s proxy handshake to %s failed: %w", proxy.Scheme, net.JoinHostPort(targetHost, strconv.Itoa(targetPort)), err)
 	}
 	return conn, nil
 }
 
-func socks5Connect(conn net.Conn, targetHost string, targetPort int) error {
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+func socks5Connect(conn net.Conn, userInfo *url.Userinfo, targetHost string, targetPort int) error {
+	methods := []byte{0x00}
+	if userInfo != nil && userInfo.Username() != "" {
+		methods = append(methods, 0x02)
+	}
+	if _, err := conn.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
 		return err
 	}
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return err
 	}
-	if buf[0] != 0x05 || buf[1] != 0x00 {
-		return fmt.Errorf("SOCKS5 no-auth negotiation failed: %x", buf)
+	if buf[0] != 0x05 || buf[1] == 0xff {
+		return fmt.Errorf("SOCKS5 authentication negotiation failed: %x", buf)
+	}
+	if buf[1] == 0x02 {
+		if userInfo == nil || userInfo.Username() == "" {
+			return fmt.Errorf("SOCKS5 proxy requires username/password")
+		}
+		username := []byte(userInfo.Username())
+		passwordValue, _ := userInfo.Password()
+		password := []byte(passwordValue)
+		if len(username) > 255 || len(password) > 255 {
+			return fmt.Errorf("SOCKS5 username/password is too long")
+		}
+		auth := append([]byte{0x01, byte(len(username))}, username...)
+		auth = append(auth, byte(len(password)))
+		auth = append(auth, password...)
+		if _, err := conn.Write(auth); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return err
+		}
+		if buf[1] != 0x00 {
+			return fmt.Errorf("SOCKS5 username/password authentication failed")
+		}
+	} else if buf[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 unsupported authentication method: %d", buf[1])
 	}
 	hostBytes := []byte(targetHost)
 	if len(hostBytes) > 255 {
@@ -132,9 +181,15 @@ func socks5Connect(conn net.Conn, targetHost string, targetPort int) error {
 	}
 }
 
-func httpConnect(conn net.Conn, targetHost string, targetPort int) error {
+func httpConnect(conn net.Conn, userInfo *url.Userinfo, targetHost string, targetPort int) error {
 	target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target, target)
+	authHeader := ""
+	if userInfo != nil && userInfo.Username() != "" {
+		password, _ := userInfo.Password()
+		token := base64.StdEncoding.EncodeToString([]byte(userInfo.Username() + ":" + password))
+		authHeader = "Proxy-Authorization: Basic " + token + "\r\n"
+	}
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n%sProxy-Connection: Keep-Alive\r\nConnection: keep-alive\r\n\r\n", target, target, authHeader)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return err
 	}
@@ -157,6 +212,14 @@ func httpConnect(conn net.Conn, targetHost string, targetPort int) error {
 		}
 	}
 	return nil
+}
+
+func TestTCPProxy(ctx context.Context, proxyValue, targetHost string, targetPort int, timeout time.Duration) error {
+	conn, err := dialTCP(ctx, targetHost, targetPort, timeout, proxyValue, false)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 func mustAtoi(s string) int {

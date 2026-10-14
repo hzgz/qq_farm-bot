@@ -7,6 +7,7 @@ const props = defineProps<{
   label?: string
   disabled?: boolean
   clearable?: boolean
+  autocomplete?: string
 }>()
 const emit = defineEmits<{
   (e: 'clear'): void
@@ -32,6 +33,7 @@ const inputType = computed(() => {
         :type="inputType"
         :placeholder="placeholder"
         :disabled="disabled"
+        :autocomplete="autocomplete"
         class="base-input w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none transition-all duration-200 dark:border-gray-700 disabled:bg-gray-50 dark:text-white disabled:text-gray-400 focus:ring-2 dark:disabled:bg-gray-800/50"
         :class="{ 'pr-10': type === 'password' || (clearable && model) }"
       >

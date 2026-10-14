@@ -56,6 +56,14 @@ interface YybAccountResult {
   status?: string
 }
 
+interface YybProxyProfile {
+  id: number
+  name: string
+  protocol: 'http-connect' | 'socks5'
+  host: string
+  port: number
+}
+
 const activeTab = ref<AccountTab>('manual')
 const loading = ref(false)
 const errorMessage = ref('')
@@ -87,6 +95,10 @@ const yybQrImage = ref('')
 const yybError = ref('')
 const yybPollErrCode = ref<number | null>(null)
 const yybSuccess = ref<{ accountId: string, name: string, isUpdate: boolean } | null>(null)
+const yybProxyProfiles = ref<YybProxyProfile[]>([])
+const yybProxyMode = ref<'direct' | 'static'>('direct')
+const yybProxyProfileId = ref<number | null>(null)
+const yybProxyLoading = ref(false)
 let yybPollVersion = 0
 let yybPollController: AbortController | null = null
 
@@ -133,6 +145,31 @@ function resetYybLogin() {
   yybError.value = ''
   yybPollErrCode.value = null
   yybSuccess.value = null
+}
+
+async function loadYybProxyOptions() {
+  yybProxyLoading.value = true
+  try {
+    const response = await api.get('/api/yyb/proxy-profiles')
+    yybProxyProfiles.value = Array.isArray(response.data?.data) ? response.data.data : []
+    yybProxyMode.value = 'direct'
+    yybProxyProfileId.value = null
+    const openid = String(props.editData?.yybOpenid || '').trim()
+    if (openid) {
+      const settingResponse = await api.get('/api/yyb/account-proxy', { params: { ref: openid } })
+      const setting = settingResponse.data?.data || {}
+      yybProxyMode.value = setting.mode === 'static' ? 'static' : 'direct'
+      yybProxyProfileId.value = Number(setting.proxy_profile_id) || null
+    }
+  }
+  catch {
+    yybProxyProfiles.value = []
+    yybProxyMode.value = 'direct'
+    yybProxyProfileId.value = null
+  }
+  finally {
+    yybProxyLoading.value = false
+  }
 }
 
 async function importYybAccount(sessionId: string, version: number) {
@@ -278,11 +315,18 @@ async function pollYybLogin(sessionId: string, version: number) {
 }
 
 async function startYybLogin() {
+  if (yybProxyMode.value === 'static' && !yybProxyProfileId.value) {
+    yybError.value = '请选择静态代理配置后再生成二维码'
+    return
+  }
   resetYybLogin()
   yybStage.value = 'creating'
   const version = yybPollVersion
   try {
-    const response = await api.post('/api/yyb/qr/create', {}, { timeout: 60000 })
+    const response = await api.post('/api/yyb/qr/create', {
+      proxyMode: yybProxyMode.value,
+      proxyProfileId: yybProxyMode.value === 'static' ? yybProxyProfileId.value : null,
+    }, { timeout: 60000 })
     const sessionId = String(response.data?.data?.session_id || '').trim()
     const image = String(response.data?.data?.image_base64 || '').trim()
     if (!sessionId || !image)
@@ -670,6 +714,7 @@ watch(() => props.show, (newVal) => {
     resetYybLogin()
     captureHelpMode.value = localStorage.getItem(CAPTURE_SUCCESS_STORAGE_KEY) === '1' ? 'daily' : 'first'
     void loadCaptureConfig()
+    void loadYybProxyOptions()
     if (props.defaultTab === 'capture') {
       // 首页"抓包登录"入口：明确要抓包 → 优先进入抓包 tab（无论账号类型）
       activeTab.value = 'capture'
@@ -812,6 +857,37 @@ onBeforeUnmount(() => {
               placeholder="留空则使用微信昵称"
               :disabled="yybStage !== 'idle' && yybStage !== 'error' && yybStage !== 'expired'"
             />
+
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label class="block">
+                <span class="mb-1.5 block text-sm font-medium" :style="{ color: 'var(--theme-text)' }">连接模式</span>
+                <select
+                  v-model="yybProxyMode"
+                  :disabled="yybProxyLoading || (yybStage !== 'idle' && yybStage !== 'error' && yybStage !== 'expired')"
+                  class="min-h-11 w-full border border-gray-200 rounded-lg bg-transparent px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700"
+                >
+                  <option value="direct">直连</option>
+                  <option value="static">静态代理</option>
+                </select>
+              </label>
+              <label class="block">
+                <span class="mb-1.5 block text-sm font-medium" :style="{ color: 'var(--theme-text)' }">代理配置</span>
+                <select
+                  v-model.number="yybProxyProfileId"
+                  :disabled="yybProxyMode !== 'static' || yybProxyLoading || (yybStage !== 'idle' && yybStage !== 'error' && yybStage !== 'expired')"
+                  class="min-h-11 w-full border border-gray-200 rounded-lg bg-transparent px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-700"
+                >
+                  <option :value="null">{{ yybProxyProfiles.length ? '请选择代理' : '请先到代理设置添加' }}</option>
+                  <option v-for="profile in yybProxyProfiles" :key="profile.id" :value="profile.id">
+                    {{ profile.name }}（{{ profile.host }}:{{ profile.port }}）
+                  </option>
+                </select>
+              </label>
+            </div>
+
+            <div class="rounded-lg px-3 py-2 text-xs leading-5" style="background-color: color-mix(in srgb, var(--theme-primary) 8%, transparent); color: var(--theme-text);">
+              扫码、凭据刷新、Code 获取和协议连接均使用此账号出口；静态代理故障时不会自动回退直连。
+            </div>
 
             <div
               v-if="yybError"
