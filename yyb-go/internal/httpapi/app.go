@@ -1,18 +1,18 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
-	"bytes"
-	"io"
-	"log"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,7 +22,6 @@ import (
 	"yyb_go/internal/protocol"
 	"yyb_go/internal/qr"
 	"yyb_go/internal/store"
-
 )
 
 type Config struct {
@@ -808,7 +807,7 @@ func (a *App) cleanupQR(keep map[string]bool) {
 }
 
 func terminalQR(status string) bool {
-	return status == "expired" || status == "cancelled" || status == "unknown"
+	return status == "expired" || status == "cancelled"
 }
 
 type apiEnvelope struct {
@@ -846,7 +845,6 @@ func requestLogger(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
 
 func readFileOrFallback(filepath, fallback string) (string, error) {
 	data, err := os.ReadFile(filepath)

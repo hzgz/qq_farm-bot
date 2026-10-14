@@ -1510,7 +1510,10 @@ function getAccounts() {
 
 function normalizeAccountsData(data) {
     const input = data && typeof data === 'object' ? data : {};
-    const accounts = Array.isArray(input.accounts) ? input.accounts : [];
+    const accounts = (Array.isArray(input.accounts) ? input.accounts : [])
+        .map(account => account && typeof account === 'object'
+            ? { ...account, autoStart: account.autoStart !== false }
+            : account);
     const maxId = accounts.reduce((max, acc) =>
         Math.max(max, Number.parseInt(acc && acc.id, 10) || 0), 0);
 
@@ -1614,6 +1617,7 @@ function addOrUpdateAccount(account) {
             avatar: nextAvatar || '',
             username: account.username || '',
             yybOpenid: account.yybOpenid ? String(account.yybOpenid) : '',
+            autoStart: account.autoStart !== false,
             createdAt: Date.now(),
             updatedAt: Date.now()
         });

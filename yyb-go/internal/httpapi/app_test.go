@@ -8,6 +8,19 @@ import (
 	"time"
 )
 
+func TestTerminalQRUnknownCanBeRetried(t *testing.T) {
+	for _, status := range []string{"pending", "scanned", "unknown", "authorized", "confirmed"} {
+		if terminalQR(status) {
+			t.Errorf("terminalQR(%q) = true, want false", status)
+		}
+	}
+	for _, status := range []string{"expired", "cancelled"} {
+		if !terminalQR(status) {
+			t.Errorf("terminalQR(%q) = false, want true", status)
+		}
+	}
+}
+
 func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 	t.Setenv("GIN_MODE", "test")
 
@@ -23,7 +36,14 @@ func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 	}
 	defer app.Close()
 
-	handler := app.Handler()
+	previousToken := ApiToken
+	ApiToken = "httpapi-test-token"
+	t.Cleanup(func() { ApiToken = previousToken })
+	routes := app.Handler()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+ApiToken)
+		routes.ServeHTTP(w, r)
+	})
 
 	health := httptest.NewRecorder()
 	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/health", nil))

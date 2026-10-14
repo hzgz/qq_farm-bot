@@ -18,6 +18,13 @@ function getResourcePath(...segments) {
     return path.join(getResourceRoot(), ...segments);
 }
 
+/** 获取程序根目录（源码模式为仓库根目录，打包模式为 exe 所在目录） */
+function getProgramRoot() {
+    return isPackaged
+        ? path.dirname(process.execPath)
+        : path.join(__dirname, '../../..');
+}
+
 /** 获取可写文件的根目录（打包模式用 exe 同级，源码模式用上级目录） */
 function getAppRootForWritable() {
     return isPackaged
@@ -60,6 +67,7 @@ function getShareFilePath() {
 
 module.exports = {
     isPackaged,
+    getProgramRoot,
     getResourcePath,
     getDataDir,
     getDataFile,

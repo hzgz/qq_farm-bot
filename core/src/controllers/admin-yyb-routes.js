@@ -72,14 +72,14 @@ async function callYybApi(apiBase, path, apiKey, init = {}) {
     // 应用宝统一响应：{ code:0, msg, data }
     if (data && typeof data === "object" && "code" in data) {
       if (data.code !== 0) {
-        return { ok: false, error: data.msg || `应用宝接口错误 code=${data.code}`, yybCode: data.code };
+        return { ok: false, error: data.msg || `应用宝接口错误 code=${data.code}`, yybCode: data.code, retryable: resp.status >= 500 };
       }
       return { ok: true, data: data.data };
     }
     // 非 envelope 响应，直接返回
     return { ok: true, data };
   } catch (e) {
-    return { ok: false, error: `应用宝接口请求失败: ${e.message}` };
+    return { ok: false, error: `应用宝接口请求失败: ${e.message}`, retryable: true };
   }
 }
 
@@ -166,7 +166,7 @@ function registerAdminYybRoutes({ app, requireAdminToken, sendProviderError }) {
         signal: controller.signal,
       });
       if (!result.ok) {
-        return res.status(400).json({ ok: false, error: result.error, yybCode: result.yybCode });
+        return res.status(result.retryable ? 502 : 400).json({ ok: false, error: result.error, yybCode: result.yybCode });
       }
       // data: { status: pending|scanned|authorized|confirmed|expired|cancelled, errcode? }
       res.json({ ok: true, data: result.data });

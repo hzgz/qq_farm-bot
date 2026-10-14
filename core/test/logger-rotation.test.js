@@ -7,13 +7,27 @@ const assert = require('node:assert/strict');
 const {
   LOG_RETENTION_MS,
   buildHourlyLogFilename,
-  cleanupExpiredLogFiles
+  cleanupExpiredLogFiles,
+  resolveLogDir
 } = require('../src/services/logger');
 
 test('builds hourly log filenames in local time', () => {
   const date = new Date(2026, 6, 11, 15, 42, 30);
   assert.equal(buildHourlyLogFilename('combined', date), 'combined-2026-07-11-15.log');
   assert.equal(buildHourlyLogFilename('error', date), 'error-2026-07-11-15.log');
+});
+
+test('defaults logs to the program root and honors FARM_LOG_DIR', () => {
+  const oldLogDir = process.env.FARM_LOG_DIR;
+  delete process.env.FARM_LOG_DIR;
+  try {
+    assert.equal(resolveLogDir(), path.join(__dirname, '../..', 'logs'));
+    process.env.FARM_LOG_DIR = path.join(os.tmpdir(), 'custom-farm-logs');
+    assert.equal(resolveLogDir(), path.resolve(process.env.FARM_LOG_DIR));
+  } finally {
+    if (oldLogDir === undefined) delete process.env.FARM_LOG_DIR;
+    else process.env.FARM_LOG_DIR = oldLogDir;
+  }
 });
 
 test('removes only managed log files older than 72 hours', () => {

@@ -28,6 +28,7 @@ function createWorkerManager(deps) {
     } = deps;
 
     const scheduler = createScheduler('worker_manager');
+    const startingWorkers = new Map();
 
     // 应用宝离线重连的独立计数（不受 startWorker 成功清零影响，否则 maxAttempts 会失效导致无限重连）
     const reconnectAttemptsMap = new Map();
@@ -160,7 +161,9 @@ function createWorkerManager(deps) {
      * 失败则沿用旧 code（可能已过期，但让 worker 自己报错更直观）。
      */
     async function refreshYybCodeIfNeeded(account) {
-        if (!account || account.loginType !== 'yyb' || !account.yybOpenid) return;
+        if (!account || account.loginType !== 'yyb' || !account.yybOpenid) {
+            return { ok: false, error: '账号不是有效的应用宝账号' };
+        }
         try {
             // 第三方 YYB：直接调第三方接口换 code（与内置 yyb-go 同协议、可刷新）
             if (account.provider === 'thirdparty' && account.thirdparty
@@ -177,31 +180,35 @@ function createWorkerManager(deps) {
                     log('系统', `账号 ${account.name} 第三方应用宝 code 已自动刷新`, {
                         accountId: String(account.id),
                     });
-                } else {
-                    log('系统', `账号 ${account.name} 第三方应用宝 code 刷新失败: ${result.error}`, {
-                        accountId: String(account.id),
-                    });
+                    return { ok: true, code: result.code, source: 'yyb' };
                 }
-                return;
+                const error = result.error || '第三方应用宝刷新失败';
+                log('系统', `账号 ${account.name} 第三方应用宝 code 刷新失败: ${error}`, {
+                        accountId: String(account.id),
+                });
+                return { ok: false, error, source: 'yyb' };
             }
             // 内置 YYB（走 yyb-go）
             const store = require('../models/store');
             const wxConfig = store.getGlobalWxConfig ? store.getGlobalWxConfig() : null;
-            if (!wxConfig || !wxConfig.apiBase || !wxConfig.apiKey) {
+            const yybApiBase = String(process.env.YYB_API_URL || (wxConfig && wxConfig.apiBase) || '').trim();
+            const yybApiKey = String(process.env.YYB_API_KEY || (wxConfig && wxConfig.apiKey) || '').trim();
+            if (!yybApiBase || !yybApiKey) {
+                const error = '应用宝接口未配置';
                 log('系统', `账号 ${account.name} 应用宝接口未配置，使用旧 code 启动`, {
                     accountId: String(account.id),
                 });
-                return;
+                return { ok: false, error, source: 'yyb' };
             }
             // 规范化 apiBase：去掉尾部斜杠和可能误带的路径后缀
-            const rawBase = String(wxConfig.apiBase).trim().replace(/\/+$/, '');
+            const rawBase = yybApiBase.replace(/\/+$/, '');
             const base = rawBase.replace(/\/wxapp\/getCode$/i, '').replace(/\/wxapp$/i, '').replace(/\/accounts$/i, '');
-            const appId = wxConfig.appId || 'wx5306c5978fdb76e4';
+            const appId = (wxConfig && wxConfig.appId) || 'wx5306c5978fdb76e4';
             const resp = await fetch(`${base}/wxapp/getCode`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    Authorization: `Bearer ${wxConfig.apiKey}`,
+                    Authorization: `Bearer ${yybApiKey}`,
                 },
                 body: JSON.stringify({ ref: account.yybOpenid, app_id: appId }),
             });
@@ -211,26 +218,42 @@ function createWorkerManager(deps) {
                 log('系统', `账号 ${account.name} 应用宝 code 已自动刷新`, {
                     accountId: String(account.id),
                 });
-            } else {
-                const msg = (data && data.msg) || '未知错误';
-                log('系统', `账号 ${account.name} 应用宝 code 刷新失败: ${msg}`, {
-                    accountId: String(account.id),
-                    yybCode: data && data.code,
-                });
+                return { ok: true, code: account.code, source: 'yyb' };
             }
+            const error = (data && data.msg) || '应用宝未返回 Code';
+            log('系统', `账号 ${account.name} 应用宝 code 刷新失败: ${error}`, {
+                accountId: String(account.id),
+                yybCode: data && data.code,
+            });
+            return { ok: false, error, source: 'yyb' };
         } catch (e) {
             log('系统', `账号 ${account.name} 应用宝 code 刷新异常: ${e.message}`, {
                 accountId: String(account.id),
             });
+            return { ok: false, error: e.message || '应用宝 Code 刷新异常', source: 'yyb' };
         }
     }
 
     /**
      * 启动账号 Worker
      */
-    async function startWorker(account) {
+    async function startWorker(account, options = {}) {
         if (!account || !account.id) return false;
         if (workers[account.id]) return false;
+
+        const pending = startingWorkers.get(account.id);
+        if (pending && !pending.cancelled) return pending.promise;
+        const start = { cancelled: false, promise: null };
+        startingWorkers.set(account.id, start);
+        start.promise = performStartWorker(account, start, options);
+        try {
+            return await start.promise;
+        } finally {
+            if (startingWorkers.get(account.id) === start) startingWorkers.delete(account.id);
+        }
+    }
+
+    async function performStartWorker(account, start, options) {
 
         log('系统', `正在启动账号: ${  account.name}`, {
             accountId: String(account.id),
@@ -238,7 +261,8 @@ function createWorkerManager(deps) {
         });
 
         // 应用宝账号：启动前自动刷新 code
-        await refreshYybCodeIfNeeded(account);
+        if (!options.skipYybRefresh) await refreshYybCodeIfNeeded(account);
+        if (start.cancelled || workers[account.id]) return false;
 
         let proc = null;
         try {
@@ -348,6 +372,8 @@ function createWorkerManager(deps) {
      */
     function stopWorker(accountId, opts = {}) {
         const { resetReconnect = true } = opts;
+        const pending = startingWorkers.get(accountId);
+        if (pending) pending.cancelled = true;
         const wrk = workers[accountId];
         if (!wrk) return;
 
@@ -379,13 +405,13 @@ function createWorkerManager(deps) {
     /**
      * 重启账号 Worker
      */
-    async function restartWorker(account) {
+    async function restartWorker(account, options = {}) {
         if (!account) return;
         const accountId = account.id;
         const wrk = workers[accountId];
 
         // 如果未运行，直接启动
-        if (!wrk) return startWorker(account);
+        if (!wrk) return startWorker(account, options);
 
         const targetProc = wrk.process;
         let restarted = false;
@@ -396,11 +422,11 @@ function createWorkerManager(deps) {
             scheduler.clear(`restart_fallback_${  accountId}`);
 
             const current = workers[accountId];
-            if (!current) return startWorker(account);
+            if (!current) return startWorker(account, options);
             if (current.process !== targetProc) return;
 
             delete workers[accountId];
-            await startWorker(account);
+            await startWorker(account, options);
         };
 
         const forceKill = () => {
@@ -821,6 +847,7 @@ function createWorkerManager(deps) {
         startWorker,
         stopWorker,
         restartWorker,
+        refreshYybCodeIfNeeded,
         callWorkerApi
     };
 }

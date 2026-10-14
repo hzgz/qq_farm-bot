@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -31,8 +33,8 @@ const (
 
 var (
 	uuidRE = regexp.MustCompile(`/connect/qrcode/([^"'>\s]+)`)
-	errRE  = regexp.MustCompile(`wx_errcode\s*=\s*(\d+)`)
-	codeRE = regexp.MustCompile(`wx_code\s*=\s*'([^']*)'`)
+	errRE  = regexp.MustCompile(`wx_errcode\s*=\s*["']?(\d+)`)
+	codeRE = regexp.MustCompile(`wx_code\s*=\s*(?:'([^']*)'|"([^"]*)")`)
 )
 
 type Session struct {
@@ -157,6 +159,9 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		"uuid": {sess.WXUUID},
 		"_":    {strconv.FormatInt(time.Now().UnixMilli(), 10)},
 	}.Encode()
+	if sess.Status == "scanned" {
+		u += "&last=404"
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
@@ -166,31 +171,49 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := sess.HTTPClient.Do(req)
 	if err != nil {
+		var timeoutErr net.Error
+		if ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeoutErr) && timeoutErr.Timeout())) {
+			// A long-poll timeout means no new event, not an expired QR session.
+			status := "pending"
+			if sess.Status == "scanned" {
+				status = "scanned"
+			}
+			return PollResult{Status: status}, nil
+		}
 		return PollResult{}, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return PollResult{}, fmt.Errorf("WeChat QR poll HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return PollResult{}, fmt.Errorf("read WeChat QR poll: %w", err)
+	}
 	text := string(body)
 	errcode, code := parsePoll(text)
-	switch {
-	case errcode != nil && *errcode == 408:
+	switch status := classifyPoll(errcode, code); status {
+	case "pending":
+		if sess.Status == "scanned" {
+			return PollResult{Status: "scanned", ErrCode: errcode}, nil
+		}
 		sess.Status = "pending"
 		return PollResult{Status: "pending", ErrCode: errcode, Code: code}, nil
-	case errcode != nil && *errcode == 404:
+	case "scanned":
 		sess.Status = "scanned"
 		return PollResult{Status: "scanned", ErrCode: errcode, Code: code}, nil
-	case errcode != nil && *errcode == 403:
+	case "cancelled":
 		sess.Status = "cancelled"
 		return PollResult{Status: "cancelled", ErrCode: errcode, Code: code}, nil
-	case errcode != nil && *errcode == 402:
+	case "expired":
 		sess.Status = "expired"
 		return PollResult{Status: "expired", ErrCode: errcode, Code: code}, nil
-	case errcode != nil && *errcode == 405 && code != "":
+	case "authorized":
 		sess.AuthorizeCode = code
 		sess.Status = "authorized"
 		return PollResult{Status: "authorized", ErrCode: errcode, Code: code}, nil
 	default:
-		sess.Status = "unknown"
+		// Preserve the last known scan state across an unrecognized response.
 		if len(text) > 200 {
 			text = text[:200]
 		}
@@ -253,10 +276,31 @@ func parsePoll(text string) (*int, string) {
 		out = &n
 	}
 	code := ""
-	if m := codeRE.FindStringSubmatch(text); len(m) == 2 {
-		code = m[1]
+	if m := codeRE.FindStringSubmatch(text); len(m) == 3 {
+		code = m[1] + m[2]
 	}
 	return out, code
+}
+
+func classifyPoll(errcode *int, code string) string {
+	if errcode == nil {
+		return "unknown"
+	}
+	switch *errcode {
+	case 408:
+		return "pending"
+	case 404:
+		return "scanned"
+	case 403:
+		return "cancelled"
+	case 402:
+		return "expired"
+	case 405:
+		if code != "" {
+			return "authorized"
+		}
+	}
+	return "unknown"
 }
 
 func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBufferCredentials, error) {

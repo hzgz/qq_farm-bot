@@ -38,8 +38,7 @@
 
   <script>
     const $ = id => document.getElementById(id);
-    const QR_TTL = 110;             // 秒,到点自动重新生成(早于微信真正过期)
-    let sid = null, pollTimer = null, cdTimer = null, secsLeft = 0;
+    let sid = null, pollTimer = null, pollInFlight = false;
 
     async function api(method, url) {
       const r = await fetch(url, { method });
@@ -54,17 +53,7 @@
       return isEnvelope ? d.data : d;
     }
     function setStatus(text, cls) { const s = $("status"); s.textContent = text; s.className = "status " + cls; }
-    function stopTimers() { if (pollTimer) clearInterval(pollTimer); if (cdTimer) clearInterval(cdTimer); pollTimer = cdTimer = null; }
-
-    function startCountdown() {
-      secsLeft = QR_TTL;
-      $("countdown").textContent = `二维码 ${secsLeft}s 后自动刷新`;
-      cdTimer = setInterval(() => {
-        secsLeft--;
-        $("countdown").textContent = secsLeft > 0 ? `二维码 ${secsLeft}s 后自动刷新` : "二维码已过期，正在刷新…";
-        if (secsLeft <= 0) { stopTimers(); newQr(); }
-      }, 1000);
-    }
+    function stopTimers() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 
     async function newQr() {
       stopTimers();
@@ -77,20 +66,24 @@
         sid = r.session_id;
         $("qrWrap").innerHTML = `<img src="${r.image_url}?t=${Date.now()}" alt="二维码">`;
         setStatus("等待扫码…", "s-pending");
-        startCountdown();
         pollTimer = setInterval(poll, 1500);
       } catch (e) { setStatus("获取二维码失败: " + JSON.stringify(e.data ?? e), "s-err"); }
     }
 
     async function poll() {
-      if (!sid) return;
+      if (!sid || pollInFlight) return;
+      pollInFlight = true;
       let st;
-      try { st = await api("GET", `/qr/${sid}/poll`); } catch { return; }
-      if (st.status === "pending") setStatus("等待扫码…", "s-pending");
-      else if (st.status === "scanned") setStatus("已扫码，请在手机上确认", "s-scanned");
-      else if (st.status === "authorized" || st.status === "confirmed") { stopTimers(); await confirm(); }
-      else if (st.status === "expired" || st.status === "unknown") { stopTimers(); setStatus("二维码已失效，正在重新生成…", "s-err"); newQr(); }
-      else if (st.status === "cancelled") { stopTimers(); setStatus("已取消，请重新生成二维码", "s-err"); $("countdown").textContent = ""; }
+      try {
+        st = await api("GET", `/qr/${sid}/poll`);
+        if (st.status === "pending") setStatus("等待扫码…", "s-pending");
+        else if (st.status === "scanned") setStatus("已扫码，请在手机上确认", "s-scanned");
+        else if (st.status === "authorized" || st.status === "confirmed") { stopTimers(); await confirm(); }
+        else if (st.status === "expired") { stopTimers(); setStatus("微信确认二维码已过期，请点击重新生成", "s-err"); }
+        else if (st.status === "unknown") setStatus("状态暂不可确认，正在继续查询…", "s-pending");
+        else if (st.status === "cancelled") { stopTimers(); setStatus("已取消，请重新生成二维码", "s-err"); $("countdown").textContent = ""; }
+      } catch { return; }
+      finally { pollInFlight = false; }
     }
 
     async function confirm() {

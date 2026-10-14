@@ -16,7 +16,10 @@ function isAdminUser(user) {
 }
 
 function hasWxRefreshIdentity(account) {
-  return !!String((account && account.wxid) || "").trim();
+  if (!account) return false;
+  const hasYybIdentity = account.loginType === "yyb"
+    && !!String(account.yybOpenid || "").trim();
+  return hasYybIdentity || !!String(account.wxid || "").trim();
 }
 
 function registerAdminAccountRoutes({
@@ -105,7 +108,8 @@ function registerAdminAccountRoutes({
             accountId: account.id,
             name: account.name || account.nick || account.id,
             ok: success,
-            error: success ? "" : "刷新失败",
+            source: result && result.source ? result.source : "",
+            error: success ? "" : ((result && result.error) || "刷新失败"),
           });
         } catch (error) {
           results.push({
@@ -196,6 +200,39 @@ function registerAdminAccountRoutes({
       const nextAccount = isUpdate
         ? { ...body, id: resolvedId || String(body.id) }
         : body;
+
+      // Keep one main-program account per YYB identity and prevent stale clients
+      // from replacing the identity of the record currently being edited.
+      const nextYybOpenid = String(nextAccount.yybOpenid || "").trim();
+      if (nextYybOpenid) {
+        const accounts = provider.getAccounts().accounts || [];
+        const nextProvider = nextAccount.provider === "thirdparty"
+          ? "thirdparty"
+          : "builtin";
+        const identityOwner = accounts.find((account) => {
+          const accountProvider = account.provider === "thirdparty"
+            ? "thirdparty"
+            : "builtin";
+          return accountProvider === nextProvider
+            && String(account.yybOpenid || "").trim() === nextYybOpenid;
+        });
+        if (identityOwner && String(identityOwner.id) !== String(nextAccount.id || "")) {
+          return res.status(409).json({
+            ok: false,
+            error: "该应用宝微信已添加，请直接使用现有账号",
+          });
+        }
+        const existing = isUpdate
+          ? accounts.find((account) => String(account.id) === String(nextAccount.id))
+          : null;
+        if (existing && existing.yybOpenid
+          && String(existing.yybOpenid).trim() !== nextYybOpenid) {
+          return res.status(409).json({
+            ok: false,
+            error: "扫码微信与原账号不一致，请添加为新账号；原账号已保留",
+          });
+        }
+      }
 
       let wasRunning = false;
       if (isUpdate && provider.isAccountRunning) {

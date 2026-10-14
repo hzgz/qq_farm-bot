@@ -121,7 +121,7 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
       const data = result.data
       if (!result.ok) {
         if (data && data.total > 0) {
-          showAlert(`微信 Code 刷新完成：成功 ${data.success} 个，失败 ${data.failed} 个`, 'danger')
+          showAlert(`微信 Code 刷新完成：成功 ${data.success} 个，失败 ${data.failed} 个。失败账号保持原运行状态。`, 'danger')
         }
         else {
           showAlert(result.error || '没有可刷新的微信账号', 'danger')
@@ -129,8 +129,13 @@ export function useAccountSettings(showAlert: (message: string, type?: AlertType
         return
       }
 
-      const skippedText = data && data.skipped > 0 ? `，跳过 ${data.skipped} 个非微信账号` : ''
-      showAlert(`微信 Code 刷新完成：成功 ${data?.success || 0} 个${skippedText}`, 'primary')
+      const yybCount = data?.results?.filter(item => item.ok && item.source === 'yyb').length || 0
+      const wxidCount = data?.results?.filter(item => item.ok && item.source === 'wxid').length || 0
+      const sourceText = [yybCount ? `应用宝 ${yybCount} 个` : '', wxidCount ? `微信授权 ${wxidCount} 个` : '']
+        .filter(Boolean)
+        .join('，')
+      const skippedText = data && data.skipped > 0 ? `；跳过 ${data.skipped} 个非微信账号` : ''
+      showAlert(`微信 Code 刷新完成：成功 ${data?.success || 0} 个${sourceText ? `（${sourceText}）` : ''}${skippedText}`, 'primary')
     }
     catch (error: any) {
       showAlert(error.response?.data?.error || error.message || '刷新微信 Code 失败', 'danger')

@@ -12,6 +12,11 @@ const { createReloginReminderService } = require('./relogin-reminder');
 const { createRuntimeState } = require('./runtime-state');
 const { createWorkerManager } = require('./worker-manager');
 
+function getRestorableAccounts(accounts) {
+    return (Array.isArray(accounts) ? accounts : [])
+        .filter(account => account && account.autoStart !== false);
+}
+
 /** 操作类型键列表 */
 const OPERATION_KEYS = [
     'harvest', 'water', 'weed', 'bug', 'farming', 'fertilize', 'plant',
@@ -92,6 +97,7 @@ function createRuntimeEngine(options = {}) {
         startWorker,
         stopWorker,
         restartWorker,
+        refreshYybCodeIfNeeded,
         callWorkerApi
     } = createWorkerManager({
         fork,
@@ -141,6 +147,7 @@ function createRuntimeEngine(options = {}) {
         startWorker,
         stopWorker,
         restartWorker,
+        refreshYybCodeIfNeeded,
         scheduleAutoCodeRefresh: autoCodeRefresh.scheduleAccount,
         refreshAccountCode: autoCodeRefresh.refreshAccountCode
     };
@@ -173,14 +180,17 @@ function createRuntimeEngine(options = {}) {
         }
     }
 
-    /** 启动所有账号 */
+    /** 恢复上次仍处于运行状态的账号；旧数据没有 autoStart 时按运行恢复。 */
     async function startAllAccounts() {
         const accounts = store.getAccounts().accounts || [];
-        if (accounts.length > 0) {
-            log('系统', `发现 ${  accounts.length  } 个账号，正在启动...`);
-            for (const acc of accounts) {
+        const restorable = getRestorableAccounts(accounts);
+        if (restorable.length > 0) {
+            log('系统', `发现 ${restorable.length} 个需恢复运行的账号，正在启动...`);
+            for (const acc of restorable) {
                 await startWorker(acc);
             }
+        } else if (accounts.length > 0) {
+            log('系统', '所有账号上次均已停止，不自动启动');
         } else {
             log('系统', '未发现账号，请访问管理面板添加账号');
         }
@@ -235,4 +245,4 @@ function createRuntimeEngine(options = {}) {
     };
 }
 
-module.exports = { createRuntimeEngine };
+module.exports = { createRuntimeEngine, getRestorableAccounts };

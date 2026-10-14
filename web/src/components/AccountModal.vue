@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useIntervalFn } from '@vueuse/core'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import api from '@/api'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
@@ -10,7 +10,7 @@ const props = defineProps<{
   show: boolean
   editData?: any
   // 打开时默认选中的标签：capture = 直接进抓包登录（首页快捷入口用）
-  defaultTab?: 'capture' | 'manual'
+  defaultTab?: 'capture' | 'manual' | 'yyb'
 }>()
 
 const emit = defineEmits(['close', 'saved', 'refresh'])
@@ -46,7 +46,17 @@ interface CaptureFlowState {
   }
 }
 
-const activeTab = ref<'capture' | 'manual'>('manual')
+type AccountTab = 'capture' | 'manual' | 'yyb'
+type YybLoginStage = 'idle' | 'creating' | 'pending' | 'scanned' | 'unknown' | 'authorized' | 'importing' | 'success' | 'expired' | 'error'
+
+interface YybAccountResult {
+  openid: string
+  nickname?: string
+  alias?: string
+  status?: string
+}
+
+const activeTab = ref<AccountTab>('manual')
 const loading = ref(false)
 const errorMessage = ref('')
 const captureEnabled = ref(false)
@@ -71,11 +81,225 @@ const showCaptureHelp = ref(false)
 const captureHelpMode = ref<'first' | 'daily'>('first')
 const captureHelpDevice = ref<'ios' | 'android'>('ios')
 
+const yybAccountName = ref('')
+const yybStage = ref<YybLoginStage>('idle')
+const yybQrImage = ref('')
+const yybError = ref('')
+const yybPollErrCode = ref<number | null>(null)
+const yybSuccess = ref<{ accountId: string, name: string, isUpdate: boolean } | null>(null)
+let yybPollVersion = 0
+let yybPollController: AbortController | null = null
+
 const form = reactive({
   name: '',
   code: '',
   platform: 'qq' as 'qq' | 'wx',
 })
+
+const yybStatusText = computed(() => {
+  const labels: Record<YybLoginStage, string> = {
+    idle: '准备扫码',
+    creating: '正在生成二维码',
+    pending: '请使用微信扫码',
+    scanned: '已扫码，请在手机确认',
+    unknown: yybPollErrCode.value === null
+      ? '暂时无法识别扫码状态，仍在查询；也可重新生成'
+      : `暂时无法识别扫码状态（${yybPollErrCode.value}），仍在查询；也可重新生成`,
+    authorized: '授权成功，正在获取账号',
+    importing: '正在写入 Code 并启动账号',
+    success: '账号已就绪',
+    expired: '二维码已失效',
+    error: '扫码登录失败',
+  }
+  return labels[yybStage.value]
+})
+
+const yybBusy = computed(() => ['creating', 'authorized', 'importing'].includes(yybStage.value))
+
+function getRequestError(error: any, fallback: string) {
+  return String(error?.response?.data?.error || error?.response?.data?.message || error?.message || fallback)
+}
+
+function stopYybPolling() {
+  yybPollVersion += 1
+  yybPollController?.abort()
+  yybPollController = null
+}
+
+function resetYybLogin() {
+  stopYybPolling()
+  yybStage.value = 'idle'
+  yybQrImage.value = ''
+  yybError.value = ''
+  yybPollErrCode.value = null
+  yybSuccess.value = null
+}
+
+async function importYybAccount(sessionId: string, version: number) {
+  if (version !== yybPollVersion)
+    return
+  yybStage.value = 'authorized'
+
+  const confirmResponse = await api.post('/api/yyb/qr/confirm', { sessionId }, { timeout: 60000 })
+  if (version !== yybPollVersion)
+    return
+  const yybAccount = confirmResponse.data?.data as YybAccountResult | undefined
+  const openid = String(yybAccount?.openid || '').trim()
+  if (!openid)
+    throw new Error('应用宝未返回 openid')
+
+  yybStage.value = 'importing'
+  const codeResponse = await api.post('/api/yyb/getcode', { openid }, { timeout: 60000 })
+  if (version !== yybPollVersion)
+    return
+  const code = String(codeResponse.data?.data?.code || '').trim()
+  if (!code)
+    throw new Error('应用宝未返回登录 Code')
+
+  const accountsResponse = await api.get('/api/accounts')
+  if (version !== yybPollVersion)
+    return
+  const accounts = Array.isArray(accountsResponse.data?.data?.accounts)
+    ? accountsResponse.data.data.accounts
+    : []
+  // Match the scanned identity, never the record currently open for editing.
+  const matchedAccount = accounts.find((account: any) =>
+    account.provider !== 'thirdparty' && String(account.yybOpenid || '').trim() === openid,
+  )
+  const enteredName = yybAccountName.value.trim()
+  const inheritedEditName = props.editData
+    && enteredName === String(props.editData.name || '').trim()
+    && String(matchedAccount?.id || '') !== String(props.editData.id)
+  const accountName = (inheritedEditName ? '' : enteredName)
+    || String(matchedAccount?.name || yybAccount?.nickname || yybAccount?.alias || '').trim()
+    || `应用宝账号 ${openid.slice(-6)}`
+
+  const saveResponse = await api.post('/api/accounts', {
+    ...(matchedAccount?.id ? { id: matchedAccount.id } : {}),
+    name: accountName,
+    code,
+    platform: 'wx',
+    loginType: 'yyb',
+    provider: 'builtin',
+    yybOpenid: openid,
+  })
+  if (!saveResponse.data?.ok)
+    throw new Error(saveResponse.data?.error || '保存应用宝账号失败')
+  if (version !== yybPollVersion)
+    return
+
+  const savedAccounts = Array.isArray(saveResponse.data?.data?.accounts)
+    ? saveResponse.data.data.accounts
+    : []
+  const savedAccount = matchedAccount?.id
+    ? savedAccounts.find((account: any) => String(account.id) === String(matchedAccount.id))
+    : savedAccounts.find((account: any) =>
+        account.provider !== 'thirdparty' && String(account.yybOpenid || '').trim() === openid,
+      )
+  const accountId = String(savedAccount?.id || matchedAccount?.id || '')
+  if (!accountId)
+    throw new Error('账号已保存，但未能确认账号 ID')
+
+  await api.post(`/api/accounts/${encodeURIComponent(accountId)}/start`, {}, { timeout: 20000 })
+  if (version !== yybPollVersion)
+    return
+
+  yybSuccess.value = {
+    accountId,
+    name: accountName,
+    isUpdate: !!matchedAccount,
+  }
+  yybStage.value = 'success'
+  yybQrImage.value = ''
+  emit('refresh', accountId)
+}
+
+async function pollYybLogin(sessionId: string, version: number) {
+  let failures = 0
+  while (true) {
+    if (version !== yybPollVersion || !props.show || activeTab.value !== 'yyb')
+      return
+
+    const controller = new AbortController()
+    yybPollController = controller
+    try {
+      const response = await api.post('/api/yyb/qr/poll', { sessionId }, {
+        timeout: 70000,
+        signal: controller.signal,
+      })
+      if (version !== yybPollVersion)
+        return
+      failures = 0
+      yybError.value = ''
+
+      const status = String(response.data?.data?.status || 'unknown')
+      const rawErrCode = response.data?.data?.errcode
+      yybPollErrCode.value = typeof rawErrCode === 'number' ? rawErrCode : null
+      if (status === 'authorized' || status === 'confirmed') {
+        await importYybAccount(sessionId, version)
+        return
+      }
+      if (status === 'expired' || status === 'cancelled') {
+        yybStage.value = 'expired'
+        yybError.value = status === 'cancelled' ? '已在手机端取消，请重新生成二维码' : '微信确认二维码已过期，请重新生成'
+        return
+      }
+      yybStage.value = status === 'scanned' ? 'scanned' : status === 'pending' ? 'pending' : 'unknown'
+    }
+    catch (error: any) {
+      if (error?.code === 'ERR_CANCELED' || version !== yybPollVersion)
+        return
+      const transient = !error?.response || error.response.status >= 500
+      if (!['authorized', 'importing'].includes(yybStage.value) && transient && ++failures <= 3) {
+        yybStage.value = 'unknown'
+        yybPollErrCode.value = null
+      }
+      else {
+        yybStage.value = 'error'
+        yybError.value = getRequestError(error, '查询扫码状态失败，请重试')
+        return
+      }
+    }
+    // Long polls can also return immediately; pace retries and cancel the delay
+    // when closing the modal or replacing the QR session.
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>
+      const finish = () => {
+        clearTimeout(timer)
+        controller.signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      timer = setTimeout(finish, 1500 * Math.max(1, failures))
+      controller.signal.addEventListener('abort', finish, { once: true })
+      if (controller.signal.aborted)
+        finish()
+    })
+  }
+}
+
+async function startYybLogin() {
+  resetYybLogin()
+  yybStage.value = 'creating'
+  const version = yybPollVersion
+  try {
+    const response = await api.post('/api/yyb/qr/create', {}, { timeout: 60000 })
+    const sessionId = String(response.data?.data?.session_id || '').trim()
+    const image = String(response.data?.data?.image_base64 || '').trim()
+    if (!sessionId || !image)
+      throw new Error('应用宝未返回有效二维码')
+    if (version !== yybPollVersion)
+      return
+    yybQrImage.value = image
+    yybStage.value = 'pending'
+    void pollYybLogin(sessionId, version)
+  }
+  catch (error: any) {
+    if (error?.code === 'ERR_CANCELED' || version !== yybPollVersion)
+      return
+    yybStage.value = 'error'
+    yybError.value = getRequestError(error, '生成应用宝二维码失败，请确认服务已启动')
+  }
+}
 
 const captureHelpSteps = computed(() => {
   // 电脑端：全自动，无需手动设代理与证书
@@ -134,10 +358,11 @@ const captureCurrentStep = computed(() => {
 })
 
 const captureNextStep = computed(() => {
-  if (!captureFlow.value)
+  if (!captureFlow.value) {
     return captureDeviceMode.value === 'pc'
       ? '点击开始后直接打开电脑 QQ 农场即可'
       : '开始后按本次显示的代理信息设置手机 Wi-Fi'
+  }
   if (!captureFlow.value.codeCaptured) {
     return captureFlow.value.deviceMode === 'pc'
       ? '保持农场页面打开，Code 会自动捕获'
@@ -214,6 +439,25 @@ async function startCaptureSession() {
   }
 }
 
+// 成功页轮询：检测后台自动启动是否已完成
+// （不点「立即启动」时，后端会在好友 GID 同步结束后自动启动账号）
+const { pause: pauseSuccessPoll, resume: resumeSuccessPoll } = useIntervalFn(async () => {
+  const success = captureSuccess.value
+  if (!success || capturedStarted.value || !success.accountId)
+    return
+  try {
+    const { data } = await api.get('/api/accounts')
+    const acc = (data?.data?.accounts || []).find((a: any) => String(a.id) === String(success.accountId))
+    if (acc?.running) {
+      capturedStarted.value = true
+      capturedStartNote.value = '后台已自动启动，正在登录游戏...'
+      pauseSuccessPoll()
+      emit('refresh', success.accountId)
+    }
+  }
+  catch {}
+}, 2500, { immediate: false })
+
 async function completeCaptureAccount() {
   if (!captureFlow.value || captureCompleting.value)
     return
@@ -254,25 +498,6 @@ async function completeCaptureAccount() {
     captureCompleting.value = false
   }
 }
-
-// 成功页轮询：检测后台自动启动是否已完成
-// （不点「立即启动」时，后端会在好友 GID 同步结束后自动启动账号）
-const { pause: pauseSuccessPoll, resume: resumeSuccessPoll } = useIntervalFn(async () => {
-  const success = captureSuccess.value
-  if (!success || capturedStarted.value || !success.accountId)
-    return
-  try {
-    const { data } = await api.get('/api/accounts')
-    const acc = (data?.data?.accounts || []).find((a: any) => String(a.id) === String(success.accountId))
-    if (acc?.running) {
-      capturedStarted.value = true
-      capturedStartNote.value = '后台已自动启动，正在登录游戏...'
-      pauseSuccessPoll()
-      emit('refresh', success.accountId)
-    }
-  }
-  catch {}
-}, 2500, { immediate: false })
 
 // 抓包成功后「立即启动」：不等好友 GID 后台同步完成
 async function startCapturedAccount() {
@@ -418,6 +643,7 @@ function close() {
   stopCaptureCheck()
   pauseSuccessPoll()
   void cancelCaptureSession()
+  resetYybLogin()
   showCaptureHelp.value = false
   captureSuccess.value = null
   capturedStarted.value = false
@@ -440,6 +666,8 @@ watch(() => props.show, (newVal) => {
     capturedStarted.value = false
     captureAccountName.value = props.editData?.name || ''
     capturePlatform.value = props.editData?.platform === 'wx' ? 'wx' : 'qq'
+    yybAccountName.value = props.editData?.name || ''
+    resetYybLogin()
     captureHelpMode.value = localStorage.getItem(CAPTURE_SUCCESS_STORAGE_KEY) === '1' ? 'daily' : 'first'
     void loadCaptureConfig()
     if (props.defaultTab === 'capture') {
@@ -451,7 +679,8 @@ watch(() => props.show, (newVal) => {
         form.code = props.editData.code || ''
         form.platform = props.editData.platform || 'qq'
       }
-    } else if (props.editData) {
+    }
+    else if (props.editData) {
       activeTab.value = 'manual'
       form.name = props.editData.name || ''
       form.code = props.editData.code || ''
@@ -469,14 +698,20 @@ watch(() => props.show, (newVal) => {
     stopCaptureCheck()
     pauseSuccessPoll()
     void cancelCaptureSession()
+    resetYybLogin()
   }
 })
 
 watch(activeTab, (tab) => {
   if (tab !== 'capture')
     void cancelCaptureSession()
+  if (tab !== 'yyb')
+    resetYybLogin()
 })
 
+onBeforeUnmount(() => {
+  stopYybPolling()
+})
 </script>
 
 <template>
@@ -486,7 +721,7 @@ watch(activeTab, (tab) => {
         <h3 class="text-lg font-semibold" :style="{ color: 'var(--theme-text)' }">
           {{ editData ? '编辑账号' : '添加账号' }}
         </h3>
-        <BaseButton variant="ghost" class="!p-1" @click="close">
+        <BaseButton variant="ghost" class="!h-11 !w-11 !p-0" title="关闭账号窗口" @click="close">
           <div class="i-carbon-close text-xl" :style="{ color: 'var(--theme-text)' }" />
         </BaseButton>
       </div>
@@ -496,9 +731,12 @@ watch(activeTab, (tab) => {
           {{ errorMessage }}
         </div>
 
-        <div class="mb-4 flex border-b" :style="{ borderColor: 'color-mix(in srgb, var(--theme-text) 10%, transparent)' }">
+        <div class="mb-4 flex border-b" role="tablist" aria-label="账号登录方式" :style="{ borderColor: 'color-mix(in srgb, var(--theme-text) 10%, transparent)' }">
           <button
-            class="flex-1 py-2 text-center text-sm font-medium transition-colors"
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'manual'"
+            class="min-h-11 flex-1 px-1 text-center text-sm font-medium transition-colors"
             :class="activeTab === 'manual' ? 'border-b-2' : 'opacity-60'"
             :style="{
               color: activeTab === 'manual' ? 'var(--theme-primary)' : 'var(--theme-text)',
@@ -509,8 +747,25 @@ watch(activeTab, (tab) => {
             手动填码
           </button>
           <button
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'yyb'"
+            class="min-h-11 flex-1 px-1 text-center text-sm font-medium transition-colors"
+            :class="activeTab === 'yyb' ? 'border-b-2' : 'opacity-60'"
+            :style="{
+              color: activeTab === 'yyb' ? 'var(--theme-primary)' : 'var(--theme-text)',
+              borderColor: 'var(--theme-primary)',
+            }"
+            @click="activeTab = 'yyb'"
+          >
+            应用宝扫码
+          </button>
+          <button
             v-if="captureEnabled"
-            class="flex-1 py-2 text-center text-sm font-medium transition-colors"
+            type="button"
+            role="tab"
+            :aria-selected="activeTab === 'capture'"
+            class="min-h-11 flex-1 px-1 text-center text-sm font-medium transition-colors"
             :class="activeTab === 'capture' ? 'border-b-2' : 'opacity-60'"
             :style="{
               color: activeTab === 'capture' ? 'var(--theme-primary)' : 'var(--theme-text)',
@@ -520,6 +775,100 @@ watch(activeTab, (tab) => {
           >
             抓包登录
           </button>
+        </div>
+
+        <div v-if="activeTab === 'yyb'" class="space-y-4">
+          <template v-if="yybSuccess">
+            <div class="flex flex-col items-center gap-3 py-4">
+              <div class="h-16 w-16 flex items-center justify-center rounded-full bg-green-100 dark:bg-green-900/30">
+                <span class="i-carbon-checkmark-filled text-4xl text-green-600 dark:text-green-400" />
+              </div>
+              <div class="text-center">
+                <div class="text-base font-semibold" :style="{ color: 'var(--theme-text)' }">
+                  {{ yybSuccess.isUpdate ? '应用宝账号已更新' : '应用宝账号已添加' }}
+                </div>
+                <div class="mt-1 break-all text-sm opacity-70" :style="{ color: 'var(--theme-text)' }">
+                  {{ yybSuccess.name }}
+                </div>
+              </div>
+            </div>
+
+            <div class="flex items-start gap-2 border border-green-200 rounded-lg bg-green-50 px-3 py-3 text-sm text-green-800 leading-6 dark:border-green-800 dark:bg-green-900/20 dark:text-green-200">
+              <span class="i-carbon-renew mt-1 flex-none" />
+              <span>Code 已写入并启动；后续启动和断线重连会自动刷新。</span>
+            </div>
+
+            <div class="flex justify-end pt-1">
+              <BaseButton variant="primary" @click="close">
+                完成
+              </BaseButton>
+            </div>
+          </template>
+
+          <template v-else>
+            <BaseInput
+              v-model="yybAccountName"
+              label="账号备注（可选）"
+              placeholder="留空则使用微信昵称"
+              :disabled="yybStage !== 'idle' && yybStage !== 'error' && yybStage !== 'expired'"
+            />
+
+            <div
+              v-if="yybError"
+              role="alert"
+              class="rounded-lg bg-red-50 p-3 text-sm text-red-700 leading-6 dark:bg-red-900/20 dark:text-red-300"
+            >
+              {{ yybError }}
+            </div>
+
+            <div v-if="yybQrImage" class="mx-auto aspect-square max-w-60 w-full overflow-hidden border border-gray-200 rounded-lg bg-white p-2 dark:border-gray-700">
+              <img
+                :src="yybQrImage"
+                alt="应用宝微信登录二维码"
+                class="h-full w-full object-contain"
+                width="224"
+                height="224"
+              >
+            </div>
+            <div v-else class="mx-auto aspect-square max-w-60 w-full flex items-center justify-center border border-gray-200 rounded-lg bg-gray-50 dark:border-gray-700 dark:bg-gray-800">
+              <span
+                class="text-5xl"
+                :class="yybBusy ? 'i-svg-spinners-ring-resize animate-spin' : 'i-carbon-qr-code'"
+                :style="{ color: 'var(--theme-primary)' }"
+              />
+            </div>
+
+            <div
+              aria-live="polite"
+              class="min-h-11 flex items-center justify-center gap-2 rounded-lg px-3 text-center text-sm font-medium"
+              :style="{
+                backgroundColor: yybStage === 'unknown'
+                  ? 'color-mix(in srgb, #d97706 12%, transparent)'
+                  : 'color-mix(in srgb, var(--theme-primary) 10%, transparent)',
+                color: 'var(--theme-text)',
+              }"
+            >
+              <span v-if="yybStage === 'scanned'" class="i-carbon-mobile-check" :style="{ color: 'var(--theme-primary)' }" />
+              <span v-else-if="yybStage === 'unknown'" class="i-carbon-warning-alt" style="color: #b45309" />
+              <span v-else-if="yybBusy" class="i-svg-spinners-ring-resize animate-spin" :style="{ color: 'var(--theme-primary)' }" />
+              <span v-else class="i-carbon-scan" :style="{ color: 'var(--theme-primary)' }" />
+              <span>{{ yybStatusText }}</span>
+            </div>
+
+            <div class="flex flex-wrap justify-end gap-2 pt-1">
+              <BaseButton variant="outline" @click="close">
+                取消
+              </BaseButton>
+              <BaseButton
+                variant="primary"
+                :loading="yybBusy"
+                @click="startYybLogin"
+              >
+                <span v-if="yybStage !== 'idle'" class="i-carbon-renew mr-1" />
+                {{ yybStage === 'idle' ? '生成二维码' : '重新生成' }}
+              </BaseButton>
+            </div>
+          </template>
         </div>
 
         <div v-if="activeTab === 'capture'" class="space-y-4">
@@ -567,222 +916,222 @@ watch(activeTab, (tab) => {
           </template>
 
           <template v-else>
-          <BaseInput
-            v-model="captureAccountName"
-            label="账号备注（可选）"
-            placeholder="留空则使用默认账号名"
-            :disabled="!!captureFlow"
-          />
+            <BaseInput
+              v-model="captureAccountName"
+              label="账号备注（可选）"
+              placeholder="留空则使用默认账号名"
+              :disabled="!!captureFlow"
+            />
 
-          <div class="flex flex-col gap-1.5">
-            <label class="text-sm font-medium" :style="{ color: 'var(--theme-text)' }">抓包设备</label>
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                class="h-9 rounded-lg px-3 text-sm transition-colors"
-                :class="captureDeviceMode === 'pc' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
-                :style="captureDeviceMode === 'pc' ? { background: 'var(--theme-gradient)' } : {}"
-                :disabled="!!captureFlow"
-                @click="captureDeviceMode = 'pc'"
-              >
-                电脑（自动配置）
-              </button>
-              <button
-                type="button"
-                class="h-9 rounded-lg px-3 text-sm transition-colors"
-                :class="captureDeviceMode === 'mobile' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
-                :style="captureDeviceMode === 'mobile' ? { background: 'var(--theme-gradient)' } : {}"
-                :disabled="!!captureFlow"
-                @click="captureDeviceMode = 'mobile'"
-              >
-                手机（手动设代理）
-              </button>
-            </div>
-            <p v-if="captureDeviceMode === 'pc'" class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
-              开始后自动设置系统代理并信任证书，直接打开电脑 QQ 农场即可抓到登录信息
-            </p>
-          </div>
-
-          <div class="flex flex-col gap-1.5">
-            <label class="text-sm font-medium" :style="{ color: 'var(--theme-text)' }">平台</label>
-            <div class="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                class="h-9 rounded-lg px-3 text-sm transition-colors"
-                :class="capturePlatform === 'qq' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
-                :style="capturePlatform === 'qq' ? { background: 'var(--theme-gradient)' } : {}"
-                :disabled="!!captureFlow"
-                @click="capturePlatform = 'qq'"
-              >
-                QQ 小程序
-              </button>
-              <button
-                type="button"
-                class="h-9 rounded-lg px-3 text-sm transition-colors"
-                :class="capturePlatform === 'wx' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
-                :style="capturePlatform === 'wx' ? { background: 'var(--theme-gradient)' } : {}"
-                :disabled="!!captureFlow"
-                @click="capturePlatform = 'wx'"
-              >
-                微信小程序
-              </button>
-            </div>
-          </div>
-
-          <button
-            v-if="!captureFlow"
-            type="button"
-            class="h-11 w-full flex items-center justify-between border border-gray-200 rounded-lg px-3 text-left text-sm dark:border-gray-700"
-            :style="{ color: 'var(--theme-text)' }"
-            @click="openCaptureHelp"
-          >
-            <span class="flex items-center gap-2">
-              <span class="i-carbon-help" :style="{ color: 'var(--theme-primary)' }" />
-              使用说明
-            </span>
-            <span class="i-carbon-chevron-right opacity-60" />
-          </button>
-
-          <div v-if="captureError" class="rounded-lg bg-red-50 p-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
-            {{ captureError }}
-          </div>
-
-          <div v-if="!captureFlow" class="flex flex-col items-center gap-3 py-4">
-            <div class="h-16 w-16 flex items-center justify-center rounded-full bg-gray-100 dark:bg-gray-800">
-              <div class="i-carbon-data-connected text-3xl" :style="{ color: 'var(--theme-primary)' }" />
-            </div>
-            <BaseButton variant="primary" :loading="captureLoading" @click="startCaptureSession">
-              开始抓取
-            </BaseButton>
-          </div>
-
-          <template v-else>
-            <div class="rounded-lg px-3 py-3 text-sm" style="background-color: color-mix(in srgb, var(--theme-primary) 10%, transparent); color: var(--theme-text);">
-              <div class="flex items-start justify-between gap-3">
-                <div class="min-w-0">
-                  <div class="text-xs opacity-60">
-                    当前步骤
-                  </div>
-                  <div class="mt-1 break-words font-semibold">
-                    {{ captureCurrentStep }}
-                  </div>
-                  <div class="mt-1 break-words text-xs opacity-70">
-                    下一步：{{ captureNextStep }}
-                  </div>
-                </div>
+            <div class="flex flex-col gap-1.5">
+              <label class="text-sm font-medium" :style="{ color: 'var(--theme-text)' }">抓包设备</label>
+              <div class="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  class="h-8 w-8 flex flex-none items-center justify-center rounded-lg hover:bg-black/5 dark:hover:bg-white/10"
-                  title="使用说明"
-                  @click="openCaptureHelp"
+                  class="h-9 rounded-lg px-3 text-sm transition-colors"
+                  :class="captureDeviceMode === 'pc' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
+                  :style="captureDeviceMode === 'pc' ? { background: 'var(--theme-gradient)' } : {}"
+                  :disabled="!!captureFlow"
+                  @click="captureDeviceMode = 'pc'"
                 >
-                  <span class="i-carbon-help text-lg" />
+                  电脑（自动配置）
+                </button>
+                <button
+                  type="button"
+                  class="h-9 rounded-lg px-3 text-sm transition-colors"
+                  :class="captureDeviceMode === 'mobile' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
+                  :style="captureDeviceMode === 'mobile' ? { background: 'var(--theme-gradient)' } : {}"
+                  :disabled="!!captureFlow"
+                  @click="captureDeviceMode = 'mobile'"
+                >
+                  手机（手动设代理）
+                </button>
+              </div>
+              <p v-if="captureDeviceMode === 'pc'" class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
+                开始后自动设置系统代理并信任证书，直接打开电脑 QQ 农场即可抓到登录信息
+              </p>
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+              <label class="text-sm font-medium" :style="{ color: 'var(--theme-text)' }">平台</label>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  class="h-9 rounded-lg px-3 text-sm transition-colors"
+                  :class="capturePlatform === 'qq' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
+                  :style="capturePlatform === 'qq' ? { background: 'var(--theme-gradient)' } : {}"
+                  :disabled="!!captureFlow"
+                  @click="capturePlatform = 'qq'"
+                >
+                  QQ 小程序
+                </button>
+                <button
+                  type="button"
+                  class="h-9 rounded-lg px-3 text-sm transition-colors"
+                  :class="capturePlatform === 'wx' ? 'text-white' : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'"
+                  :style="capturePlatform === 'wx' ? { background: 'var(--theme-gradient)' } : {}"
+                  :disabled="!!captureFlow"
+                  @click="capturePlatform = 'wx'"
+                >
+                  微信小程序
                 </button>
               </div>
             </div>
 
-            <!-- PC 模式：显示自动配置状态 -->
-            <div v-if="captureFlow.deviceMode === 'pc'" class="rounded-lg border border-gray-200 p-3 space-y-2 text-sm dark:border-gray-700">
-              <div class="flex items-center justify-between gap-3">
-                <span :style="{ color: 'var(--theme-text)' }">系统代理</span>
-                <span v-if="captureFlow.pcStatus.proxyActive" class="text-green-600 dark:text-green-400">
-                  已自动指向本机（{{ captureFlow.pcStatus.proxyServer || `127.0.0.1:${captureFlow.pcStatus.proxyPort}` }}）
-                </span>
-                <span v-else class="text-amber-600 dark:text-amber-400">
-                  未生效{{ captureFlow.pcStatus.error ? `：${captureFlow.pcStatus.error}` : '' }}
-                </span>
-              </div>
-              <div class="flex items-center justify-between gap-3">
-                <span :style="{ color: 'var(--theme-text)' }">证书信任</span>
-                <span :class="captureFlow.pcStatus.caTrusted ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'">
-                  {{ captureFlow.pcStatus.caTrusted ? '已自动安装到受信任区' : '未信任（可能影响抓包）' }}
-                </span>
-              </div>
+            <button
+              v-if="!captureFlow"
+              type="button"
+              class="h-11 w-full flex items-center justify-between border border-gray-200 rounded-lg px-3 text-left text-sm dark:border-gray-700"
+              :style="{ color: 'var(--theme-text)' }"
+              @click="openCaptureHelp"
+            >
+              <span class="flex items-center gap-2">
+                <span class="i-carbon-help" :style="{ color: 'var(--theme-primary)' }" />
+                使用说明
+              </span>
+              <span class="i-carbon-chevron-right opacity-60" />
+            </button>
+
+            <div v-if="captureError" class="rounded-lg bg-red-50 p-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
+              {{ captureError }}
             </div>
 
-            <!-- 手机模式：显示手动代理信息 -->
-            <div v-else class="grid grid-cols-2 gap-2 text-sm">
-              <div class="min-w-0 flex items-center justify-between gap-1 border border-gray-200 rounded-lg px-3 py-3 dark:border-gray-700">
-                <div class="min-w-0">
-                  <div class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
-                    代理服务器
+            <div v-if="!captureFlow" class="flex flex-col items-center gap-3 py-4">
+              <div class="h-16 w-16 flex items-center justify-center rounded-full bg-gray-100 dark:bg-gray-800">
+                <div class="i-carbon-data-connected text-3xl" :style="{ color: 'var(--theme-primary)' }" />
+              </div>
+              <BaseButton variant="primary" :loading="captureLoading" @click="startCaptureSession">
+                开始抓取
+              </BaseButton>
+            </div>
+
+            <template v-else>
+              <div class="rounded-lg px-3 py-3 text-sm" style="background-color: color-mix(in srgb, var(--theme-primary) 10%, transparent); color: var(--theme-text);">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <div class="text-xs opacity-60">
+                      当前步骤
+                    </div>
+                    <div class="mt-1 break-words font-semibold">
+                      {{ captureCurrentStep }}
+                    </div>
+                    <div class="mt-1 break-words text-xs opacity-70">
+                      下一步：{{ captureNextStep }}
+                    </div>
                   </div>
-                  <div class="mt-1 break-all font-semibold" :style="{ color: 'var(--theme-text)' }">
-                    {{ captureFlow.publicInfo.host || '-' }}
-                  </div>
+                  <button
+                    type="button"
+                    class="h-8 w-8 flex flex-none items-center justify-center rounded-lg hover:bg-black/5 dark:hover:bg-white/10"
+                    title="使用说明"
+                    @click="openCaptureHelp"
+                  >
+                    <span class="i-carbon-help text-lg" />
+                  </button>
                 </div>
+              </div>
+
+              <!-- PC 模式：显示自动配置状态 -->
+              <div v-if="captureFlow.deviceMode === 'pc'" class="border border-gray-200 rounded-lg p-3 text-sm space-y-2 dark:border-gray-700">
+                <div class="flex items-center justify-between gap-3">
+                  <span :style="{ color: 'var(--theme-text)' }">系统代理</span>
+                  <span v-if="captureFlow.pcStatus.proxyActive" class="text-green-600 dark:text-green-400">
+                    已自动指向本机（{{ captureFlow.pcStatus.proxyServer || `127.0.0.1:${captureFlow.pcStatus.proxyPort}` }}）
+                  </span>
+                  <span v-else class="text-amber-600 dark:text-amber-400">
+                    未生效{{ captureFlow.pcStatus.error ? `：${captureFlow.pcStatus.error}` : '' }}
+                  </span>
+                </div>
+                <div class="flex items-center justify-between gap-3">
+                  <span :style="{ color: 'var(--theme-text)' }">证书信任</span>
+                  <span :class="captureFlow.pcStatus.caTrusted ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'">
+                    {{ captureFlow.pcStatus.caTrusted ? '已自动安装到受信任区' : '未信任（可能影响抓包）' }}
+                  </span>
+                </div>
+              </div>
+
+              <!-- 手机模式：显示手动代理信息 -->
+              <div v-else class="grid grid-cols-2 gap-2 text-sm">
+                <div class="min-w-0 flex items-center justify-between gap-1 border border-gray-200 rounded-lg px-3 py-3 dark:border-gray-700">
+                  <div class="min-w-0">
+                    <div class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
+                      代理服务器
+                    </div>
+                    <div class="mt-1 break-all font-semibold" :style="{ color: 'var(--theme-text)' }">
+                      {{ captureFlow.publicInfo.host || '-' }}
+                    </div>
+                  </div>
+                  <BaseButton
+                    variant="ghost"
+                    size="sm"
+                    :title="captureCopiedField === 'host' ? '已复制' : '复制代理服务器'"
+                    class="flex-none !px-2"
+                    @click="copyCaptureValue('host')"
+                  >
+                    <span :class="captureCopiedField === 'host' ? 'i-carbon-checkmark text-green-600' : 'i-carbon-copy'" />
+                  </BaseButton>
+                </div>
+                <div class="min-w-0 flex items-center justify-between gap-1 border border-gray-200 rounded-lg px-3 py-3 dark:border-gray-700">
+                  <div class="min-w-0">
+                    <div class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
+                      代理端口
+                    </div>
+                    <div class="mt-1 font-semibold" :style="{ color: 'var(--theme-text)' }">
+                      {{ captureFlow.publicInfo.mitmPort || '-' }}
+                    </div>
+                  </div>
+                  <BaseButton
+                    variant="ghost"
+                    size="sm"
+                    :title="captureCopiedField === 'port' ? '已复制' : '复制代理端口'"
+                    class="flex-none !px-2"
+                    @click="copyCaptureValue('port')"
+                  >
+                    <span :class="captureCopiedField === 'port' ? 'i-carbon-checkmark text-green-600' : 'i-carbon-copy'" />
+                  </BaseButton>
+                </div>
+              </div>
+
+              <div class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-gray-800">
+                <div class="flex items-center justify-between gap-3">
+                  <span :style="{ color: 'var(--theme-text)' }">Code</span>
+                  <span :class="captureFlow.codeCaptured ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'">
+                    {{ captureFlow.codeCaptured ? '已获取' : '等待中' }}
+                  </span>
+                </div>
+                <div v-if="captureFlow.platform === 'qq'" class="mt-2 flex items-center justify-between gap-3">
+                  <span :style="{ color: 'var(--theme-text)' }">好友 GID</span>
+                  <span :style="{ color: 'var(--theme-primary)' }">{{ captureFlow.friendCount }} 个</span>
+                </div>
+                <div class="mt-2 flex items-center justify-between gap-3">
+                  <span :style="{ color: 'var(--theme-text)' }">剩余时间</span>
+                  <span :style="{ color: 'var(--theme-text)' }">{{ captureFlow.publicInfo.remainingSec }} 秒</span>
+                </div>
+              </div>
+
+              <div class="sticky bottom-0 z-10 flex flex-wrap justify-end gap-2 border-t border-gray-200 px-4 py-3 -mx-4 dark:border-gray-700" :style="{ background: 'var(--theme-bg)' }">
                 <BaseButton
-                  variant="ghost"
+                  v-if="captureFlow.deviceMode !== 'pc'"
+                  variant="secondary"
                   size="sm"
-                  :title="captureCopiedField === 'host' ? '已复制' : '复制代理服务器'"
-                  class="flex-none !px-2"
-                  @click="copyCaptureValue('host')"
+                  :href="captureFlow.publicInfo.certificateUrl"
                 >
-                  <span :class="captureCopiedField === 'host' ? 'i-carbon-checkmark text-green-600' : 'i-carbon-copy'" />
+                  <span class="i-carbon-certificate" />
+                  打开证书
+                </BaseButton>
+                <BaseButton variant="outline" size="sm" @click="cancelCaptureSession">
+                  取消抓取
+                </BaseButton>
+                <BaseButton
+                  v-if="captureFlow.codeCaptured"
+                  variant="primary"
+                  size="sm"
+                  :loading="captureCompleting"
+                  @click="completeCaptureAccount"
+                >
+                  {{ editData ? '立即更新' : '立即添加' }}
                 </BaseButton>
               </div>
-              <div class="min-w-0 flex items-center justify-between gap-1 border border-gray-200 rounded-lg px-3 py-3 dark:border-gray-700">
-                <div class="min-w-0">
-                  <div class="text-xs opacity-60" :style="{ color: 'var(--theme-text)' }">
-                    代理端口
-                  </div>
-                  <div class="mt-1 font-semibold" :style="{ color: 'var(--theme-text)' }">
-                    {{ captureFlow.publicInfo.mitmPort || '-' }}
-                  </div>
-                </div>
-                <BaseButton
-                  variant="ghost"
-                  size="sm"
-                  :title="captureCopiedField === 'port' ? '已复制' : '复制代理端口'"
-                  class="flex-none !px-2"
-                  @click="copyCaptureValue('port')"
-                >
-                  <span :class="captureCopiedField === 'port' ? 'i-carbon-checkmark text-green-600' : 'i-carbon-copy'" />
-                </BaseButton>
-              </div>
-            </div>
-
-            <div class="rounded-lg bg-gray-50 p-3 text-sm dark:bg-gray-800">
-              <div class="flex items-center justify-between gap-3">
-                <span :style="{ color: 'var(--theme-text)' }">Code</span>
-                <span :class="captureFlow.codeCaptured ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'">
-                  {{ captureFlow.codeCaptured ? '已获取' : '等待中' }}
-                </span>
-              </div>
-              <div v-if="captureFlow.platform === 'qq'" class="mt-2 flex items-center justify-between gap-3">
-                <span :style="{ color: 'var(--theme-text)' }">好友 GID</span>
-                <span :style="{ color: 'var(--theme-primary)' }">{{ captureFlow.friendCount }} 个</span>
-              </div>
-              <div class="mt-2 flex items-center justify-between gap-3">
-                <span :style="{ color: 'var(--theme-text)' }">剩余时间</span>
-                <span :style="{ color: 'var(--theme-text)' }">{{ captureFlow.publicInfo.remainingSec }} 秒</span>
-              </div>
-            </div>
-
-            <div class="sticky bottom-0 z-10 flex flex-wrap justify-end gap-2 border-t border-gray-200 px-4 py-3 -mx-4 dark:border-gray-700" :style="{ background: 'var(--theme-bg)' }">
-              <BaseButton
-                v-if="captureFlow.deviceMode !== 'pc'"
-                variant="secondary"
-                size="sm"
-                :href="captureFlow.publicInfo.certificateUrl"
-              >
-                <span class="i-carbon-certificate" />
-                打开证书
-              </BaseButton>
-              <BaseButton variant="outline" size="sm" @click="cancelCaptureSession">
-                取消抓取
-              </BaseButton>
-              <BaseButton
-                v-if="captureFlow.codeCaptured"
-                variant="primary"
-                size="sm"
-                :loading="captureCompleting"
-                @click="completeCaptureAccount"
-              >
-                {{ editData ? '立即更新' : '立即添加' }}
-              </BaseButton>
-            </div>
-          </template>
+            </template>
           </template>
         </div>
 
@@ -832,7 +1181,6 @@ watch(activeTab, (tab) => {
             </BaseButton>
           </div>
         </div>
-
       </div>
     </div>
 

@@ -57,7 +57,8 @@ async function poll(){
   const a=await api('/qr/'+sid+'/confirm',{method:'POST'});
   document.getElementById('s').textContent='添加成功: '+(a.nickname||a.openid);
  }
- if(['expired','cancelled','unknown'].includes(r.status)){clearInterval(timer)}
+ if(r.status==='unknown'){document.getElementById('s').textContent='状态暂不可确认，正在重试'}
+ if(['expired','cancelled'].includes(r.status)){clearInterval(timer)}
 }
 newQR();
 </script></body></html>`

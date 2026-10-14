@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const process = require('node:process');
-const { ensureDataDir } = require('../config/runtime-paths');
+const { getProgramRoot } = require('../config/runtime-paths');
 
 // 尝试加载 winston，失败则使用 fallback
 let winston = null;
@@ -101,11 +101,15 @@ function sanitizeMeta(meta, depth = 0) {
 
 let fallbackLogDir = null;
 
+function resolveLogDir() {
+  return process.env.FARM_LOG_DIR
+    ? path.resolve(process.env.FARM_LOG_DIR)
+    : path.join(getProgramRoot(), 'logs');
+}
+
 function ensureFallbackLogDir() {
   if (fallbackLogDir) return fallbackLogDir;
-  const logDir = process.env.FARM_LOG_DIR
-    ? path.resolve(process.env.FARM_LOG_DIR)
-    : path.join(ensureDataDir(), 'logs');
+  const logDir = resolveLogDir();
   if (!fs.existsSync(logDir)) {
     fs.mkdirSync(logDir, { recursive: true });
   }
@@ -163,9 +167,7 @@ function getRootLogger() {
   if (rootLogger) return rootLogger;
   if (!winston) { rootLogger = null; return rootLogger; }
 
-  const logDir = process.env.FARM_LOG_DIR
-    ? path.resolve(process.env.FARM_LOG_DIR)
-    : path.join(ensureDataDir(), 'logs');
+  const logDir = resolveLogDir();
   if (!fs.existsSync(logDir)) {
     fs.mkdirSync(logDir, { recursive: true });
   }
@@ -256,5 +258,6 @@ module.exports = {
   redactString,
   buildHourlyLogFilename,
   cleanupExpiredLogFiles,
+  resolveLogDir,
   LOG_RETENTION_MS
 };

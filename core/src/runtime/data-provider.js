@@ -24,6 +24,7 @@ function createDataProvider(deps) {
         startWorker,
         stopWorker,
         restartWorker,
+        refreshYybCodeIfNeeded,
         scheduleAutoCodeRefresh,
         refreshAccountCode
     } = deps;
@@ -274,9 +275,33 @@ function createDataProvider(deps) {
         refreshAccountCode: async (ref) => {
             const id = resolveAccountId(ref);
             if (!id) throw new Error('Missing x-account-id');
+            const account = findAccount(id);
+            if (!account) throw new Error('账号不存在');
+            if (account.loginType === 'yyb' && account.yybOpenid) {
+                if (typeof refreshYybCodeIfNeeded !== 'function') {
+                    throw new Error('应用宝刷新服务不可用');
+                }
+                const result = await refreshYybCodeIfNeeded(account);
+                if (!result || result.ok !== true || !result.code) {
+                    return {
+                        ok: false,
+                        source: 'yyb',
+                        error: result && result.error ? result.error : '应用宝 Code 刷新失败',
+                    };
+                }
+                store.addOrUpdateAccount({ id, code: result.code });
+                if (workers[id]) {
+                    await restartWorker(account, { skipYybRefresh: true });
+                }
+                return { ok: true, source: 'yyb' };
+            }
             if (typeof refreshAccountCode !== 'function') throw new Error('自动刷新服务不可用');
             const ok = await refreshAccountCode(id, 'manual');
-            return { ok };
+            return {
+                ok,
+                source: 'wxid',
+                error: ok ? '' : '微信 Code 刷新失败',
+            };
         },
 
         setUITheme: async (theme) => {
@@ -314,6 +339,8 @@ function createDataProvider(deps) {
             const id = resolveAccountId(ref);
             const account = findAccount(id || ref);
             if (!account) return false;
+            account.autoStart = true;
+            store.addOrUpdateAccount({ id: account.id, autoStart: true });
             startWorker(account);
             return true;
         },
@@ -322,6 +349,8 @@ function createDataProvider(deps) {
             const id = resolveAccountId(ref);
             const account = findAccount(id || ref);
             if (!account) return false;
+            account.autoStart = false;
+            store.addOrUpdateAccount({ id: account.id, autoStart: false });
             if (id) stopWorker(id);
             return true;
         },

@@ -16,6 +16,9 @@ export interface Account {
   avatarUrl?: string
   username?: string
   platform?: string
+  loginType?: string
+  yybOpenid?: string
+  autoStart?: boolean
   running?: boolean
   // Add other fields as discovered
 }
@@ -29,6 +32,7 @@ export interface RefreshWxCodesResult {
     accountId: string
     name: string
     ok: boolean
+    source?: 'yyb' | 'wxid'
     error?: string
   }>
 }
